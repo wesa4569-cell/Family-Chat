@@ -566,26 +566,27 @@
     const isGroup = Boolean(currentGroupId || msg.group_id);
     const senderName = (msg.sender_name || msg.sender || "").trim();
     const senderLine = (isGroup && !isSent && senderName) ? `<div class="msg-sender">${escapeHtml(senderName)}</div>` : "";
+    const timeLine = `<div class="message-meta"><span class="message-time">${t}</span></div>`;
 
     if (type === "image" && mediaUrl) {
       const safeUrl = escapeHtml(mediaUrl);
-      return `${senderLine}<div class="media-wrap"><a href="${safeUrl}" target="_blank" rel="noopener"><img class="msg-image" src="${safeUrl}" alt="image" loading="lazy"></a></div><div class="message-time">${t}</div>`;
+      return `<div class="message-inner">${senderLine}<div class="message-body"><div class="media-wrap"><a href="${safeUrl}" target="_blank" rel="noopener"><img class="msg-image" src="${safeUrl}" alt="image" loading="lazy"></a></div></div>${timeLine}</div>`;
     }
     if (type === "audio" && mediaUrl) {
       const safeUrl = escapeHtml(mediaUrl);
-      return `${senderLine}<div class="media-wrap"><audio controls preload="none" src="${safeUrl}"></audio></div><div class="message-time">${t}</div>`;
+      return `<div class="message-inner">${senderLine}<div class="message-body"><div class="media-wrap"><audio controls preload="none" src="${safeUrl}"></audio></div></div>${timeLine}</div>`;
     }
     if ((type === "video" || (type === "file" && (msg.media_mime || "").toLowerCase().startsWith("video/"))) && mediaUrl) {
       const safeUrl = escapeHtml(mediaUrl);
-      return `${senderLine}<div class="media-wrap"><video controls preload="metadata" src="${safeUrl}" style="max-width:100%;border-radius:12px;"></video></div><div class="message-time">${t}</div>`;
+      return `<div class="message-inner">${senderLine}<div class="message-body"><div class="media-wrap"><video controls preload="metadata" src="${safeUrl}"></video></div></div>${timeLine}</div>`;
     }
     if (type === "file" && mediaUrl) {
       const safeUrl = escapeHtml(mediaUrl);
       const fname = escapeHtml(msg.content || "ملف");
       const mime2 = escapeHtml(msg.media_mime || "");
-      return `${senderLine}<div class="file-wrap"><a class="file-link" href="${safeUrl}" target="_blank" rel="noopener"><i class="bi bi-paperclip"></i><span class="file-name">${fname}</span></a>${mime2 ? `<div class="file-mime">${mime2}</div>` : ``}</div><div class="message-time">${t}</div>`;
+      return `<div class="message-inner">${senderLine}<div class="message-body"><div class="file-wrap"><a class="file-link" href="${safeUrl}" target="_blank" rel="noopener"><i class="bi bi-paperclip"></i><span class="file-name">${fname}</span></a>${mime2 ? `<div class="file-mime">${mime2}</div>` : ``}</div></div>${timeLine}</div>`;
     }
-    return `${senderLine}<div>${escapeHtml(msg.content || "")}</div><div class="message-time">${t}</div>`;
+    return `<div class="message-inner">${senderLine}<div class="message-body">${escapeHtml(msg.content || "")}</div>${timeLine}</div>`;
   }
 
   // ====== Notifications ======
