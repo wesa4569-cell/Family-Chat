@@ -21,3 +21,29 @@ instance/
 # OS
 .DS_Store
 Thumbs.db
+# SSL certificates
+*.der
+*.pem
+*.key
+certs/
+
+# Uploaded media (test data)
+static/uploads/
+static/profile_pics/*.jpg
+static/profile_pics/*.png
+
+# Local IDE files
+*.sublime-*
+.vscode/
+
+# Old/unused files
+webpush_routes.py
+generate_vapid.py
+
+# Temporary files
+*.tmp
+*.temp
+
+# Database
+*.db
+instance/

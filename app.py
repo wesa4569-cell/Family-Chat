@@ -1,4 +1,9 @@
 import os
+from urllib.parse import urlparse
+db_url = os.environ.get("DATABASE_URL")
+if db_url and db_url.startswith("postgres://"):
+    db_url = db_url.replace("postgres://", "postgresql://", 1)
+    os.environ["DATABASE_URL"] = db_url
 import re
 import mimetypes
 import json
