@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Database
+*.db
+
+# SSL certificates
+certs/
+*.pem
+*.key
+
+# Instance folder
+instance/
+
+# Environment variables
+.env
+
+# OS
+.DS_Store
+Thumbs.db

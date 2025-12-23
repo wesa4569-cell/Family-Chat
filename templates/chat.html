@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="UTF-8">
+  <!-- مهم للموبايل -->
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <title>محادثات عائلية</title>
+  <link rel="icon" href="{{ url_for('static', filename='logo.png') }}" type="image/png">
+  <link rel="manifest" href="{{ url_for('static', filename='manifest.json') }}">
+  <meta name="theme-color" content="#667eea">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <link rel="preload" as="audio" href="{{ url_for('static', filename='sounds/notify.wav') }}">
+
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/chat.css') }}?v=14">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css">
+</head>
+
+<body data-user-id="{{ current_user.id }}">
+  <div class="background-layer">
+  </div>
+
+  <div class="overlay" id="overlay"></div>
+
+  <div class="chat-container">
+    <div class="users-list" id="usersDrawer">
+      <!-- المستخدم الحالي -->
+      <div class="current-user-profile" style="padding: 16px; border-bottom: 1px solid rgba(0,0,0,0.1); display: flex; align-items: center; gap: 12px; background: rgba(255,255,255,0.55);">
+        <div style="position: relative; cursor: pointer;" onclick="document.getElementById('profile-upload').click()" title="انقر لتغيير الصورة">
+          <img
+            src="{{ url_for('static', filename='profile_pics/' + (current_user.profile_pic or 'default.png')) }}"
+            alt="Profile"
+            style="width: 56px; height: 56px; border-radius: 50%; object-fit: cover; border: 2px solid #667eea; transition: all 0.2s ease;"
+            id="current-user-img"
+          >
+          <div style="position: absolute; bottom: 0; right: 0; background: #667eea; color: white; border-radius: 50%; width: 22px; height: 22px; display: flex; align-items: center; justify-content: center; font-size: 13px; border: 2px solid white;">
+            📷
+          </div>
+        </div>
+
+        <div style="overflow: hidden; min-width: 0;">
+          <div style="font-weight: bold; font-size: 16px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">{{ current_user.name }}</div>
+          <div style="font-size: 12px; color: #666; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">{{ current_user.phone_number }}</div>
+        </div>
+
+        <input type="file" id="profile-upload" style="display: none;" accept="image/*">
+      </div>
+
+      <div class="users-list-header">
+        <h3>المحادثات</h3>
+      </div>
+
+      <ul id="users-list">
+  <li class="user-item add-group" id="btnAddGroup">
+    <div class="avatar-circle group"><i class="bi bi-people-fill"></i></div>
+    <div class="user-info">
+      <div class="user-name">إضافة مجموعة جديدة</div>
+      <div class="user-status">إنشاء مجموعة ودعوة أعضاء</div>
+    </div>
+  </li>
+
+  
+  <li class="user-item invites {% if not pending_group_invites or (pending_group_invites|length)==0 %}hidden{% endif %}" id="btnGroupInvites">
+    <div class="avatar-circle"><i class="bi bi-inbox-fill"></i></div>
+    <div class="user-info">
+      <div class="user-name">طلبات المجموعات</div>
+      <div class="user-status" id="invitesText">{% if pending_group_invites and (pending_group_invites|length)>0 %}لديك {{ pending_group_invites|length }} طلب{% else %}لا توجد طلبات{% endif %}</div>
+    </div>
+    <span class="badge" id="invitesBadge">{% if pending_group_invites and (pending_group_invites|length)>0 %}{{ pending_group_invites|length }}{% else %}0{% endif %}</span>
+  </li>
+
+
+  {# قائمة موحّدة للمستخدمين + المجموعات مرتبة حسب آخر رسالة #}
+  {% for c in conversations %}
+    {% if c.type == 'group' %}
+      {% set g = c.group %}
+      <li data-group-id="{{ g.id }}" data-name="{{ g.name }}" data-owner-id="{{ g.owner_id }}" data-is-owner="{% if g.owner_id == current_user.id %}1{% else %}0{% endif %}"
+        data-last-ms="{% if c.ts %}{{ (c.ts.timestamp() * 1000) | int }}{% else %}0{% endif %}"
+        class="user-item {% if active_group and active_group.id == g.id %}active{% endif %}">
+        <div class="avatar-circle group"><i class="bi bi-people"></i></div>
+        <div class="user-info">
+          <div class="user-name">{{ g.name }}</div>
+          <div class="user-status">مجموعة</div>
+        </div>
+        <span class="badge-unread" style="display:none;"></span>
+      </li>
+    {% else %}
+      {% set user = c.user %}
+      <li data-user-id="{{ user.id }}"
+          data-name="{{ user.name }}"
+          data-last-ms="{% if c.ts %}{{ (c.ts.timestamp() * 1000) | int }}{% else %}0{% endif %}"
+          data-avatar="{{ url_for('static', filename='profile_pics/' ~ (user.profile_pic or 'default.png')) }}"
+          class="user-item {% if active_user and active_user.id == user.id %}active{% endif %}">
+        <img src="{{ url_for('static', filename='profile_pics/' ~ (user.profile_pic or 'default.png')) }}" alt="{{ user.name }}">
+        <div class="user-info">
+          <div class="user-name">{{ user.name }}</div>
+          <div class="user-status">{{ user.phone_number }}</div>
+        </div>
+        <span class="badge-unread" style="display:none;"></span>
+      </li>
+    {% endif %}
+  {% endfor %}
+</ul>
+
+      <div class="logout-button-container">
+        <button class="logout-button" id="logout-btn">🚪 تسجيل الخروج</button>
+      </div>
+    </div>
+
+    <div class="chat-box">
+      <div class="chat-header">
+        <button class="menu-btn" id="openUsers" type="button" aria-controls="usersDrawer">☰ <span>المحادثات</span></button>
+        <div class="chat-title-wrap">
+          <img id="chat-avatar" class="chat-avatar" src="{% if active_user %}{{ url_for('static', filename='profile_pics/' ~ (active_user.profile_pic or 'default.png')) }}{% else %}{{ url_for('static', filename='profile_pics/default.png') }}{% endif %}" alt="avatar">
+          <h4 id="chat-title">{% if active_user %}{{ active_user.name }}{% else %}اختر محادثة{% endif %}</h4>
+        </div>
+        <span style="opacity:0.9;font-size:12px;" id="netStatus"></span>
+
+        <div class="dropdown" id="groupActionsWrap" style="display:none;">
+          <button class="btn btn-sm btn-outline-light dropdown-toggle" type="button" id="groupActionsBtn" data-bs-toggle="dropdown" aria-expanded="false">
+            ⚙️
+          </button>
+          <ul class="dropdown-menu dropdown-menu-end" aria-labelledby="groupActionsBtn">
+            <li><button class="dropdown-item" type="button" id="btnEditGroup">تعديل اسم المجموعة</button></li>
+            <li><button class="dropdown-item text-danger" type="button" id="btnDeleteGroup">حذف المجموعة</button></li>
+            <li><hr class="dropdown-divider"></li>
+            <li><button class="dropdown-item" type="button" id="btnLeaveGroup">الخروج من المجموعة</button></li>
+            <li><button class="dropdown-item" type="button" id="btnBlockGroup">حظر المجموعة</button></li>
+
+            <li><hr class="dropdown-divider"></li>
+            <li class="dropdown-header">الإشعارات</li>
+
+            <li class="dropdown-item notif-row" style="cursor:default;">
+              <label class="notif-label" for="notifMuteToggle">كتم الصوت</label>
+              <input class="notif-toggle" type="checkbox" id="notifMuteToggle">
+            </li>
+
+            <li class="dropdown-item notif-row" style="cursor:default;">
+              <label class="notif-label" for="notifVolumeRange">مستوى الصوت</label>
+              <input class="notif-range" type="range" id="notifVolumeRange" min="0" max="100" step="1" value="40">
+              <span class="notif-value" id="notifVolumeValue">40%</span>
+            </li>
+
+            <li class="dropdown-item notif-row" style="cursor:default;">
+              <label class="notif-label" for="notifSoundMessage">صوت الرسائل</label>
+              <select class="notif-select" id="notifSoundMessage">
+                <option value="notify">Notify (افتراضي)</option>
+                <option value="soft">Soft</option>
+                <option value="ping">Ping</option>
+              </select>
+            </li>
+
+            <li class="dropdown-item notif-row" style="cursor:default;">
+              <label class="notif-label" for="notifSoundMention">صوت التنبيه</label>
+              <select class="notif-select" id="notifSoundMention">
+                <option value="notify">Notify (افتراضي)</option>
+                <option value="soft">Soft</option>
+                <option value="ping">Ping</option>
+              </select>
+            </li>
+
+            
+            <li class="dropdown-item notif-row" style="cursor:default;">
+              <label class="notif-label" for="notifSoundGroup">صوت المجموعات</label>
+              <select class="notif-select" id="notifSoundGroup">
+                <option value="notify">Notify (افتراضي)</option>
+                <option value="soft">Soft</option>
+                <option value="ping">Ping</option>
+              </select>
+            </li>
+
+            <li class="dropdown-item notif-row" style="cursor:default;">
+              <label class="notif-label" for="notifSoundSystem">صوت النظام</label>
+              <select class="notif-select" id="notifSoundSystem">
+                <option value="soft">Soft (هادئ)</option>
+                <option value="notify">Notify</option>
+                <option value="ping">Ping</option>
+              </select>
+            </li>
+
+            <li><hr class="dropdown-divider"></li>
+            <li class="dropdown-header">إشعارات بالخلفية</li>
+
+            <li class="dropdown-item notif-row" style="cursor:default;">
+              <label class="notif-label" for="pushEnableToggle">تفعيل إشعارات عند إغلاق الصفحة</label>
+              <input class="notif-toggle" type="checkbox" id="pushEnableToggle">
+            </li>
+
+            <li class="dropdown-item notif-row" style="cursor:default;">
+              <button class="dropdown-item notif-test-btn" type="button" id="pushTestBtn">🛰️ إرسال إشعار تجريبي (Push)</button>
+            </li>
+
+<li class="dropdown-item notif-row" style="cursor:default;">
+              <button class="dropdown-item notif-test-btn" type="button" id="notifTestBtn">🔊 اختبار الصوت</button>
+            </li>
+
+          </ul>
+        </div>
+
+      </div>
+
+      <div class="messages" id="messages">
+        <div class="empty-state" id="empty-state">
+          <div style="font-size: 64px; margin-bottom: 16px;">💬</div>
+          <h5 style="margin:0 0 8px 0;">لا توجد رسائل بعد</h5>
+          <p style="margin:0;">ابدأ محادثة جديدة!</p>
+        </div>
+      </div>
+
+      <form class="message-input" id="message-form">
+  <input type="hidden" id="receiver-id" value="{% if active_user %}{{ active_user.id }}{% endif %}">
+  <input type="hidden" id="group-id" value="{% if active_group %}{{ active_group.id }}{% endif %}">
+
+  <button type="button" class="tool-btn" id="attach-btn" aria-label="مرفقات" title="مرفقات">
+    <i class="bi bi-paperclip"></i>
+  </button>
+  <input type="file" id="file-input" accept="*/*" hidden>
+
+  <button type="button" class="tool-btn" id="camera-btn" aria-label="كاميرا" title="كاميرا">
+    <i class="bi bi-camera"></i>
+  </button>
+  <input type="file" id="camera-input" accept="image/*" capture="environment" hidden>
+
+  <button type="button" class="tool-btn" id="mic-btn" aria-label="تسجيل صوت" title="تسجيل صوت">
+    <i class="bi bi-mic"></i>
+  </button>
+  <input type="file" id="audio-input" accept="audio/*" capture="microphone" hidden>
+
+  <button type="button" class="emoji-btn" id="emoji-toggle" aria-label="Emoji" title="إيموجي">
+    <i class="bi bi-emoji-smile"></i>
+  </button>
+  <div class="emoji-picker" id="emoji-picker" aria-label="Emoji Picker"></div>
+
+  <input type="text" name="content" id="message-content" placeholder="اكتب رسالتك هنا..." required autocomplete="off">
+
+  <button type="submit" aria-label="send" title="إرسال">
+    <i class="bi bi-send-fill"></i>
+  </button>
+</form>
+    </div>
+  </div>
+
+
+  
+  <!-- Create Group Modal -->
+  <div class="modal-overlay hidden" id="createGroupModal">
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="createGroupTitle">
+      <h3 id="createGroupTitle">إنشاء مجموعة</h3>
+      <p>اكتب اسم المجموعة واختر الأعضاء (الاسم إلزامي).</p>
+
+      <div class="form-row">
+        <input type="text" id="groupNameInput" placeholder="اسم المجموعة" maxlength="60" required>
+      </div>
+
+      <div class="members-box" id="groupMembersBox">
+        {% for user in users %}
+          <label class="member-row">
+            <input type="checkbox" value="{{ user.id }}">
+            <span>{{ user.name }} ({{ user.phone_number }})</span>
+          </label>
+        {% endfor %}
+      </div>
+
+      <div class="modal-actions">
+        <button type="button" class="modal-btn secondary" id="createGroupCancel">إلغاء</button>
+        <button type="button" class="modal-btn primary" id="createGroupConfirm">إنشاء</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Group Invites Modal -->
+  <div class="modal-overlay hidden" id="groupInvitesModal">
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="invitesTitle">
+      <h3 id="invitesTitle">طلبات الانضمام للمجموعات</h3>
+      <div id="invitesList" class="invites-list"></div>
+      <div class="modal-actions">
+        <button type="button" class="modal-btn secondary" id="invitesClose">إغلاق</button>
+      </div>
+    </div>
+  </div>
+
+<!-- Logout Modal -->
+  <div class="modal-overlay hidden" id="logoutModal">
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="logoutTitle">
+      <h3 id="logoutTitle">تسجيل الخروج</h3>
+      <p>هل تريد تسجيل الخروج الآن؟</p>
+      <div class="modal-actions">
+        <button type="button" class="modal-btn secondary" id="logoutCancel">إلغاء</button>
+        <button type="button" class="modal-btn danger" id="logoutConfirm">تسجيل خروج</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Delete Group Modal -->
+  <div class="modal-overlay hidden" id="deleteGroupModal">
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="deleteGroupTitle">
+      <h3 id="deleteGroupTitle">حذف المجموعة</h3>
+      <p>هل تريد حذف المجموعة نهائياً؟ هذا الإجراء لا يمكن التراجع عنه.</p>
+      <div class="modal-actions">
+        <button type="button" class="modal-btn secondary" id="deleteGroupCancel">إلغاء</button>
+        <button type="button" class="modal-btn danger" id="deleteGroupConfirm">حذف</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Leave Group Modal -->
+  <div class="modal-overlay hidden" id="leaveGroupModal">
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="leaveGroupTitle">
+      <h3 id="leaveGroupTitle">الخروج من المجموعة</h3>
+      <p>هل تريد الخروج من المجموعة؟</p>
+      <div class="modal-actions">
+        <button type="button" class="modal-btn secondary" id="leaveGroupCancel">إلغاء</button>
+        <button type="button" class="modal-btn danger" id="leaveGroupConfirm">خروج</button>
+      </div>
+    </div>
+  </div>
+  
+   <script defer src="{{ url_for('static', filename='js/chat.js') }}?v=15"></script>
+<audio id="notifySound" preload="auto">
+  <source src="{{ url_for('static', filename='sounds/notify.wav') }}" type="audio/wav">
+</audio>
+
+
+<!-- Edit Group Modal -->
+<div class="modal-overlay hidden" id="editGroupModal">
+  <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="editGroupTitle">
+    <h3 id="editGroupTitle">تعديل اسم المجموعة</h3>
+    <p>اكتب الاسم الجديد للمجموعة.</p>
+
+    <div class="form-row">
+      <input type="text" id="editGroupName" placeholder="اسم المجموعة" maxlength="80" required>
+    </div>
+
+    <div class="modal-actions">
+      <button type="button" class="modal-btn secondary" id="editGroupCancel">إلغاء</button>
+      <button type="button" class="modal-btn primary" id="btnSaveGroupName">حفظ</button>
+    </div>
+  </div>
+</div>
+
+</body>
+</html>
+  
+<button type="button" class="dropdown-item" id="pushTestBtn">
+  اختبار إشعار Push
+</button>
