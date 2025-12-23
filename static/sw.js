@@ -19,8 +19,8 @@ self.addEventListener("push", (event) => {
   const title = data.title || "💬 رسالة جديدة";
   const options = {
     body: data.body || "لديك رسالة جديدة",
-    icon: data.icon || "/static/logo.png",
-    badge: data.badge || "/static/logo.png",
+    icon: data.icon || "/static/logo.svg",
+    badge: data.badge || "/static/logo.svg",
     data: {
       url: data.url || "/",
     },

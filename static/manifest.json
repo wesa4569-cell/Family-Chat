@@ -8,14 +8,14 @@
   "description": "تطبيق محادثات عائلية بسيط وسريع",
   "icons": [
     {
-      "src": "/static/logo.png",
-      "sizes": "192x192",
-      "type": "image/png"
+      "src": "/static/logo.svg",
+      "sizes": "any",
+      "type": "image/svg+xml"
     },
     {
-      "src": "/static/logo.png",
-      "sizes": "512x512",
-      "type": "image/png"
+      "src": "/static/logo.svg",
+      "sizes": "any",
+      "type": "image/svg+xml"
     }
   ]
 }
