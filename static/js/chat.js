@@ -312,10 +312,23 @@
     if (grpSel) grpSel.value = audioManager.prefs.sounds.group || "notify";
     if (sysSel) sysSel.value = audioManager.prefs.sounds.system || "soft";
 
+    const updatePushTestState = () => {
+      if (!pushTestBtn) return;
+      const supported = ("Notification" in window) && ("serviceWorker" in navigator) && ("PushManager" in window);
+      const secure = !!window.isSecureContext;
+      const enabled = readPushEnabled();
+      pushTestBtn.disabled = !supported || !secure || !enabled;
+      if (!supported) pushTestBtn.title = "المتصفح لا يدعم إشعارات Push.";
+      else if (!secure) pushTestBtn.title = "يتطلب اتصال HTTPS بشهادة موثوقة أو localhost.";
+      else if (!enabled) pushTestBtn.title = "فعّل إشعارات الخلفية أولاً.";
+      else pushTestBtn.title = "";
+    };
+
     // push toggle
     if (pushToggle) {
       pushToggle.checked = readPushEnabled();
     }
+    updatePushTestState();
 
     muteEl.addEventListener("change", () => {
       audioManager.setMuted(muteEl.checked);
@@ -341,9 +354,11 @@
           const ok = await ensurePushSubscription();
           showToast(ok ? "🛰️ تم تفعيل إشعارات الخلفية" : "تعذر تفعيل إشعارات الخلفية");
           if (!ok) pushToggle.checked = false;
+          updatePushTestState();
         } else {
           await unsubscribePush();
           showToast("تم إيقاف إشعارات الخلفية");
+          updatePushTestState();
         }
       });
     }
@@ -734,9 +749,9 @@
     if (document.hidden && "Notification" in window && Notification.permission === "granted") {
       const n = new Notification("💬 رسالة جديدة من " + (senderName || "مستخدم"), {
         body: (content || "").substring(0, 100),
-        icon: "/static/logo.png",
+        icon: "/static/logo.svg",
         tag: id ? ("chat-" + id) : undefined,
-        badge: "/static/logo.png"
+        badge: "/static/logo.svg"
       });
       n.onclick = () => { window.focus(); n.close(); };
       setTimeout(() => n.close(), 6000);
@@ -1716,83 +1731,6 @@
   });
 
 })();
-
-async function pushTest() {
-  // 1) تأكد Permission
-  const perm = await Notification.requestPermission();
-  if (perm !== "granted") {
-    showToast("يجب السماح بالإشعارات من المتصفح أولاً", "error");
-    return;
-  }
-
-  // 2) تأكد Service Worker
-  const reg = await navigator.serviceWorker.ready;
-
-  // 3) تأكد الاشتراك (Push Subscription)
-  let sub = await reg.pushManager.getSubscription();
-  if (!sub) {
-    // ⚠️ لازم يكون عندك publicKey متوفر أصلاً في مشروعك
-    // غالبًا موجود في chat.js كـ VAPID_PUBLIC_KEY أو من endpoint
-    const publicKey = window.VAPID_PUBLIC_KEY || VAPID_PUBLIC_KEY; // عدّل حسب مشروعك
-
-    const appServerKey = urlBase64ToUint8Array(publicKey);
-    sub = await reg.pushManager.subscribe({
-      userVisibleOnly: true,
-      applicationServerKey: appServerKey
-    });
-  }
-
-  // 4) أرسل الاشتراك للسيرفر
-  const r1 = await fetch("/api/push/subscribe", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(sub)
-  });
-
-  if (!r1.ok) {
-    const t = await r1.text();
-    showToast("فشل حفظ الاشتراك في السيرفر: " + t, "error");
-    return;
-  }
-
-  // 5) الآن نفّذ test
-  const r2 = await fetch("/api/push/test", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ title: "اختبار", body: "تم تفعيل Push بنجاح" })
-  });
-
-  const t2 = await r2.text();
-  if (!r2.ok) {
-    showToast("فشل اختبار Push: " + t2, "error");
-    return;
-  }
-
-  showToast("تم إرسال إشعار تجريبي ✅", "success");
-}
-document.addEventListener("DOMContentLoaded", () => {
-  const pushTestBtn = document.getElementById("pushTestBtn");
-  if (!pushTestBtn) return;
-
-  pushTestBtn.addEventListener("click", async () => {
-    try {
-      const r = await fetch("/api/push/test", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ title: "اختبار", body: "إشعار Push يعمل ✅", url: "/chat" })
-      });
-
-      const txt = await r.text();
-      if (!r.ok) {
-        showToast("فشل اختبار Push: " + txt, "error");
-        return;
-      }
-      showToast("تم إرسال اختبار Push ✅", "success");
-    } catch (e) {
-      showToast("خطأ أثناء اختبار Push: " + (e?.message || e), "error");
-    }
-  });
-});
 
 function startSidebarPolling() {
   if (sidebarInterval) clearInterval(sidebarInterval);

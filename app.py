@@ -377,78 +377,31 @@ def push_unsubscribe():
 
 @app.route("/api/push/test", methods=["POST"])
 def api_push_test():
-    print("[PUSH] /api/push/test called")
-    print("[PUSH] json:", request.get_json(silent=True))
+    if not login_required():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
 
-    # يقبل JSON أو بدون JSON
     data = request.get_json(silent=True) or {}
     title = data.get("title") or "اختبار إشعار"
     body = data.get("body") or "تم تفعيل إشعارات Push بنجاح ✅"
     url = data.get("url") or "/chat"
 
-    # هذه القائمة يجب أن تكون نفس المكان الذي تحفظ فيه subscriptions داخل مشروعك
-    # غالبًا اسمها PUSH_SUBSCRIPTIONS أو SUBSCRIPTIONS أو webpush_subscriptions
-    subs = None
-    for name in ("PUSH_SUBSCRIPTIONS", "SUBSCRIPTIONS", "WEBPUSH_SUBSCRIPTIONS", "push_subscriptions"):
-        if name in globals():
-            subs = globals().get(name)
-            break
-
-    if not subs:
-        return jsonify({
-            "ok": False,
-            "error": "NO_SUBSCRIPTIONS",
-            "detail": "لا يوجد subscriptions محفوظة. اضغط تفعيل الإشعارات أولًا ثم جرّب."
-        }), 400
-
-    # حاول إرسال Push لأوّل subscription
-    sub = subs[0]
+    me = current_user()
+    if not me:
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
 
     payload = {
         "title": title,
         "body": body,
         "url": url,
-        "icon": "/static/logo.png",
-        "badge": "/static/logo.png",
+        "icon": "/static/logo.svg",
+        "badge": "/static/logo.svg",
         "tag": "chat-push-test"
     }
 
-    try:
-        # ---- نقطة مهمة جدًا ----
-        # ابحث في app.py عن المكان الذي ترسل منه push عند وصول رسالة جديدة
-        # وستجد دالة/كود يستدعي webpush(...) غالبًا
-        # هنا سنحاول استخدام مكتبة pywebpush إن كانت مستخدمة عندك.
-
-        from pywebpush import webpush
-
-        # نفس مفاتيح VAPID المستخدمة عندك بالفعل
-        # غالبًا موجودة كمتغيرات: VAPID_PRIVATE_KEY و VAPID_CLAIMS أو VAPID_EMAIL
-        vapid_private = globals().get("VAPID_PRIVATE_KEY")
-        vapid_claims = globals().get("VAPID_CLAIMS") or {"sub": globals().get("VAPID_SUBJECT", "mailto:admin@example.com")}
-
-        if not vapid_private:
-
-            return jsonify({
-                "ok": False,
-                "error": "NO_VAPID_PRIVATE_KEY",
-                "detail": "لم أجد VAPID_PRIVATE_KEY في app.py"
-            }), 400
-
-        webpush(
-            subscription_info=sub,
-            data=json.dumps(payload),
-            vapid_private_key=vapid_private,
-            vapid_claims=vapid_claims
-        )
-
-        return jsonify({"ok": True, "sent_to": "first_subscription"}), 200
-
-    except Exception as e:
-        return jsonify({
-            "ok": False,
-            "error": "SEND_FAILED",
-            "detail": str(e)
-        }), 400
+    ok, reason = send_push_to_user_detail(me.id, payload)
+    if not ok:
+        return jsonify({"ok": False, "error": reason}), 400
+    return jsonify({"ok": True}), 200
 
 # ----------------- PWA / Service Worker -----------------
 # IMPORTANT:
@@ -534,8 +487,8 @@ class GroupMessage(db.Model):
 def favicon():
     return send_from_directory(
         os.path.join(app.root_path, "static"),
-        "logo.png",
-        mimetype="image/png"
+        "logo.svg",
+        mimetype="image/svg+xml"
     )
 
 
@@ -571,6 +524,32 @@ def register():
             user = User(phone_number=phone, name=name, verified=True)
             user.set_password(password)
             db.session.add(user)
+            db.session.flush()
+
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
+            existing_groups = Group.query.all()
+            for g in existing_groups:
+                db.session.add(
+                    GroupMember(
+                        group_id=g.id,
+                        user_id=user.id,
+                        status="accepted",
+                        invited_by=g.owner_id,
+                        invited_at=now,
+                        responded_at=now,
+                        last_read_at=now
+                    )
+                )
+                db.session.add(
+                    GroupMessage(
+                        group_id=g.id,
+                        sender_id=user.id,
+                        content=f"{user.name} انضم إلى المجموعة",
+                        message_type="text",
+                        timestamp=now
+                    )
+                )
+
             db.session.commit()
             return redirect(url_for("login", registered=True))
         except SQLAlchemyError:
@@ -1137,8 +1116,8 @@ def send_group_message():
                 payload = {
                     "title": "🎤 رسالة صوتية في المجموعة",
                     "body": f"{(sender.name if sender else 'مستخدم')}: أرسل رسالة صوتية",
-                    "icon": "/static/logo.png",
-                    "badge": "/static/logo.png",
+                    "icon": "/static/logo.svg",
+                    "badge": "/static/logo.svg",
                     "url": f"/chat?group={group_id}",
                     "tag": f"group-{group_id}-{msg.id}",
                     "meta": {"type": "group", "group_id": group_id, "sender_id": me.id, "message_id": msg.id}
@@ -1157,8 +1136,8 @@ def send_group_message():
                 payload = {
                     "title": "👥 رسالة جديدة في المجموعة",
                     "body": f"{(sender.name if sender else 'مستخدم')}: {(content[:120] if content else '')}",
-                    "icon": "/static/logo.png",
-                    "badge": "/static/logo.png",
+                    "icon": "/static/logo.svg",
+                    "badge": "/static/logo.svg",
                     "url": f"/chat?group={group_id}",
                     "tag": f"group-{group_id}-{msg.id}",
                     "meta": {"type": "group", "group_id": group_id, "sender_id": me.id, "message_id": msg.id}
@@ -1251,8 +1230,8 @@ def send_group_image():
                 payload = {
                     "title": "🖼️ صورة جديدة في المجموعة",
                     "body": f"{(sender.name if sender else 'مستخدم')}: أرسل صورة",
-                    "icon": "/static/logo.png",
-                    "badge": "/static/logo.png",
+                    "icon": "/static/logo.svg",
+                    "badge": "/static/logo.svg",
                     "url": f"/chat?group={group_id}",
                     "tag": f"group-{group_id}-{msg.id}",
                     "meta": {"type": "group", "group_id": group_id, "sender_id": me.id, "message_id": msg.id}
@@ -1342,8 +1321,8 @@ def send_group_audio():
                 payload = {
                     "title": "🎤 رسالة صوتية في المجموعة",
                     "body": f"{(sender.name if sender else 'مستخدم')}: أرسل رسالة صوتية",
-                    "icon": "/static/logo.png",
-                    "badge": "/static/logo.png",
+                    "icon": "/static/logo.svg",
+                    "badge": "/static/logo.svg",
                     "url": f"/chat?group={group_id}",
                     "tag": f"group-{group_id}-{msg.id}",
                     "meta": {"type": "group", "group_id": group_id, "sender_id": me.id, "message_id": msg.id}
@@ -1432,8 +1411,8 @@ def send_group_file():
                 payload = {
                     "title": "👥 ملف جديد في المجموعة",
                     "body": f"{(sender.name if sender else 'مستخدم')}: {orig_name}",
-                    "icon": "/static/logo.png",
-                    "badge": "/static/logo.png",
+                    "icon": "/static/logo.svg",
+                    "badge": "/static/logo.svg",
                     "url": f"/chat?group={group_id}",
                     "tag": f"group-{group_id}-{msg.id}",
                     "meta": {"type": "group", "group_id": group_id, "sender_id": sender_id, "message_id": msg.id}
@@ -1595,8 +1574,8 @@ def send_message():
             payload = {
                 "title": "💬 رسالة جديدة",
                 "body": f"{(sender.name if sender else 'مستخدم')}: {(content[:120] if content else '')}",
-                "icon": "/static/logo.png",
-                "badge": "/static/logo.png",
+                "icon": "/static/logo.svg",
+                "badge": "/static/logo.svg",
                 "url": f"/chat?user={sender_id}",
                 "tag": f"dm-{msg.id}",
                 "meta": {"type": "dm", "sender_id": sender_id, "receiver_id": receiver_id, "message_id": msg.id}
@@ -1687,8 +1666,8 @@ def send_image():
             payload = {
                 "title": "🖼️ صورة جديدة",
                 "body": f"{(sender.name if sender else 'مستخدم')}: أرسل صورة",
-                "icon": "/static/logo.png",
-                "badge": "/static/logo.png",
+                "icon": "/static/logo.svg",
+                "badge": "/static/logo.svg",
                 "url": f"/chat?user={sender_id}",
                 "tag": f"dm-{msg.id}",
                 "meta": {"type": "dm", "sender_id": sender_id, "receiver_id": receiver_id, "message_id": msg.id}
@@ -1780,8 +1759,8 @@ def send_audio():
             payload = {
                 "title": "🎤 رسالة صوتية",
                 "body": f"{(sender.name if sender else 'مستخدم')}: أرسل رسالة صوتية",
-                "icon": "/static/logo.png",
-                "badge": "/static/logo.png",
+                "icon": "/static/logo.svg",
+                "badge": "/static/logo.svg",
                 "url": f"/chat?user_id={sender_id}",
                 "tag": f"dm-{msg.id}",
                 "meta": {"type": "dm", "sender_id": sender_id, "receiver_id": receiver_id, "message_id": msg.id}
@@ -1873,8 +1852,8 @@ def send_file():
             payload = {
                 "title": "📎 ملف جديد",
                 "body": f"{(sender.name if sender else 'مستخدم')}: {orig_name}",
-                "icon": "/static/logo.png",
-                "badge": "/static/logo.png",
+                "icon": "/static/logo.svg",
+                "badge": "/static/logo.svg",
                 "url": f"/chat?user_id={sender_id}",
                 "tag": f"dm-{msg.id}",
                 "meta": {"type": "dm", "sender_id": sender_id, "receiver_id": receiver_id, "message_id": msg.id}

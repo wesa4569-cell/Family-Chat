@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Family chat logo">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#667eea" />
+      <stop offset="45%" stop-color="#6f72ff" />
+      <stop offset="100%" stop-color="#764ba2" />
+    </linearGradient>
+    <linearGradient id="bubble" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.98" />
+      <stop offset="100%" stop-color="#e7ebff" stop-opacity="0.98" />
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="120" fill="url(#bg)" />
+  <circle cx="256" cy="256" r="192" fill="rgba(255,255,255,0.14)" />
+  <path
+    d="M156 172c0-28.7 23.3-52 52-52h144c28.7 0 52 23.3 52 52v90c0 28.7-23.3 52-52 52H256l-70.4 54.6c-9.2 7.1-22.6-1-20-12.5l12.8-42.1H208c-28.7 0-52-23.3-52-52v-90z"
+    fill="url(#bubble)"
+  />
+  <circle cx="228" cy="224" r="20" fill="#6f72ff" />
+  <circle cx="284" cy="224" r="20" fill="#6f72ff" />
+  <circle cx="256" cy="292" r="26" fill="#ff9a9e" />
+  <path d="M206 305c12 18 30 28 50 28s38-10 50-28" fill="none" stroke="#6f72ff" stroke-width="10" stroke-linecap="round" />
+</svg>
