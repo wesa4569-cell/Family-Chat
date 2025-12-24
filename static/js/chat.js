@@ -36,7 +36,7 @@
       else if (type === "error") bg = "rgba(239, 68, 68, .92)";
       else if (type === "warning") bg = "rgba(245, 158, 11, .92)";
 
-      t.style.cssText = `padding:14px 20px;border-radius:14px;background:${bg};color:#fff;max-width:90vw;font-size:15px;box-shadow:0 12px 30px rgba(0,0,0,.3);animation:toastSlide 0.3s ease;backdrop-filter:blur(10px);`;
+      t.style.cssText = `padding:14px 20px;border-radius:14px;background:${bg};color:#fff;max-width:90vw;font-size:15px;box-shadow:0 12px 30px rgba(0,0,0,.3);animation:toastSlide 0.3s ease;`;
       host.appendChild(t);
 
       if (!document.querySelector("#toastStyles")) {
@@ -79,6 +79,16 @@
   let typingActive = false;
   let typingIndicator = null;
   let typingHideTimer = null;
+  let scrollRafId = null;
+  let reorderRafId = null;
+  let badgePollIntervalId = null;
+  let badgePollTimeoutId = null;
+  let badgeRefreshEnabled = false;
+
+  const MESSAGE_DOM_LIMIT = 100;
+  const MESSAGE_PAGE_LIMIT = 50;
+  const BADGE_POLL_INTERVAL_MS = 15000;
+  const BADGE_POLL_DELAY_MS = 3000;
 
   // ====== DOM Elements ======
   const messagesDiv = document.getElementById("messages");
@@ -109,6 +119,7 @@
   const micBtn = document.getElementById("mic-btn");
   const emojiToggle = document.getElementById("emoji-toggle");
   const emojiPicker = document.getElementById("emoji-picker");
+  const bodyEl = document.body;
 
   if (!messagesDiv || !form || !messageInput || !receiverInput) return;
 
@@ -458,17 +469,17 @@
 
           // Open from LEFT and keep inside viewport
           let left = Math.max(8, r.left);
-          if (left + menuW > window.innerWidth - 8) right = Math.max(8, window.innerWidth - menuW - 8);
+          if (left + menuW > window.innerWidth - 8) left = Math.max(8, window.innerWidth - menuW - 8);
 
           let top = r.bottom + 8;
           const menuH = menu.offsetHeight || 200;
           if (top + menuH > window.innerHeight - 8) {
-            top = Math.max(8, l.top - menuH - 8);
+            top = Math.max(8, r.top - menuH - 8);
           }
 
           menu.style.top = `${top}px`;
           menu.style.left = `${left}px`;
-          menu.style.right = "right";
+          menu.style.right = "auto";
           menu.style.maxWidth = `${window.innerWidth - 16}px`;
         }
         groupActionsBtn.setAttribute("aria-expanded", "true");
@@ -527,7 +538,34 @@
     document.getElementById("empty-state")?.style.setProperty("display", "none");
   }
 
+  function showMessageSkeleton() {
+    if (document.getElementById("messages-skeleton")) return;
+    const skel = document.createElement("div");
+    skel.id = "messages-skeleton";
+    skel.className = "messages-skeleton";
+    skel.innerHTML = `
+      <div class="skeleton-row"></div>
+      <div class="skeleton-row wide"></div>
+      <div class="skeleton-row"></div>
+      <div class="skeleton-row wide"></div>
+      <div class="skeleton-row"></div>
+    `;
+    messagesDiv.appendChild(skel);
+  }
+
+  function hideMessageSkeleton() {
+    document.getElementById("messages-skeleton")?.remove();
+  }
+
   // Update sidebar ordering instantly without refreshing the page
+  function scheduleReorderConversations() {
+    if (reorderRafId) return;
+    reorderRafId = requestAnimationFrame(() => {
+      reorderRafId = null;
+      reorderConversationList();
+    });
+  }
+
   function bumpConversation(kind, id, ms) {
     const ts = Number(ms || Date.now());
     let li = null;
@@ -535,7 +573,7 @@
     else li = document.querySelector(`li.user-item[data-user-id="${id}"]`);
     if (li) {
       li.setAttribute("data-last-ms", String(ts));
-      reorderConversationList();
+      scheduleReorderConversations();
     }
   }
 
@@ -544,14 +582,24 @@
     if (force || nearBottom) messagesDiv.scrollTop = messagesDiv.scrollHeight;
   }
 
-  function hardScrollToBottom() {
-    requestAnimationFrame(() => {
-      scrollToBottom(true);
-      requestAnimationFrame(() => scrollToBottom(true));
+  function scheduleScrollToBottom(force = false) {
+    if (force) scheduleScrollToBottom.force = true;
+    if (scrollRafId) return;
+    scrollRafId = requestAnimationFrame(() => {
+      scrollRafId = null;
+      const doForce = scheduleScrollToBottom.force;
+      scheduleScrollToBottom.force = false;
+      scrollToBottom(Boolean(doForce));
     });
   }
+  scheduleScrollToBottom.force = false;
 
-  function addDateSeparator(dateStr) {
+  function hardScrollToBottom() {
+    scheduleScrollToBottom(true);
+    requestAnimationFrame(() => scheduleScrollToBottom(true));
+  }
+
+  function addDateSeparator(dateStr, container) {
     const dateDiv = document.createElement("div");
     dateDiv.className = "date-separator";
     let displayDate = dateStr;
@@ -565,13 +613,13 @@
       } catch (_) {}
     }
     dateDiv.innerHTML = `<span>${displayDate}</span>`;
-    messagesDiv.appendChild(dateDiv);
+    container.appendChild(dateDiv);
   }
 
-  function appendMessage(msg) {
+  function appendMessageToFragment(msg, fragment) {
     const dkey = localDateKey(msg.timestamp_ms || 0);
     if (dkey && dkey !== lastDate) {
-      addDateSeparator(dkey);
+      addDateSeparator(dkey, fragment);
       lastDate = dkey;
     }
     const div = document.createElement("div");
@@ -579,7 +627,14 @@
     div.className = isSent ? "message sender" : "message receiver";
     div.dataset.msgId = String(msg.id);
     div.innerHTML = buildMessageInner(msg, isSent);
-    messagesDiv.appendChild(div);
+    fragment.appendChild(div);
+  }
+
+  function appendMessageNow(msg) {
+    const fragment = document.createDocumentFragment();
+    appendMessageToFragment(msg, fragment);
+    messagesDiv.appendChild(fragment);
+    pruneOldMessages();
   }
 
   function buildMessageInner(msg, isSent) {
@@ -609,6 +664,15 @@
       return `${senderLine}<div class="file-wrap"><a class="file-link" href="${safeUrl}" target="_blank" rel="noopener"><i class="bi bi-paperclip"></i><span class="file-name">${fname}</span></a>${mime2 ? `<div class="file-mime">${mime2}</div>` : ``}</div><div class="message-time">${t}</div>`;
     }
     return `${senderLine}<div>${escapeHtml(msg.content || "")}</div><div class="message-time">${t}</div>`;
+  }
+
+  function pruneOldMessages() {
+    const messages = messagesDiv.querySelectorAll(".message");
+    if (messages.length <= MESSAGE_DOM_LIMIT) return;
+    const excess = messages.length - MESSAGE_DOM_LIMIT;
+    for (let i = 0; i < excess; i += 1) {
+      messages[i].remove();
+    }
   }
 
   // ====== Notifications ======
@@ -769,10 +833,14 @@
   // ====== API - Load Messages ======
   async function loadMessages({ allowSound = false, forceScrollBottom = false, updateSidebar = true } = {}) {
     if (!currentReceiverId && !currentGroupId) return;
+    const isInitial = lastMessageId === 0 && lastMessageTimestamp === 0;
+    const limitParam = isInitial ? `&limit=${MESSAGE_PAGE_LIMIT}` : "";
     const url = currentGroupId
-      ? `/get_group_messages/${currentGroupId}?last_id=${lastMessageId}`
-      : `/get_messages/${currentReceiverId}?since=${lastMessageTimestamp}&last_id=${lastMessageId}`;
+      ? `/get_group_messages/${currentGroupId}?last_id=${lastMessageId}${limitParam}`
+      : `/get_messages/${currentReceiverId}?since=${lastMessageTimestamp}&last_id=${lastMessageId}${limitParam}`;
     try {
+      if (isInitial) showMessageSkeleton();
+      console.time("loadMessages");
       const res = await fetch(url, { cache: "no-store" });
       const data = await res.json();
       if (!Array.isArray(data)) return;
@@ -780,12 +848,13 @@
 
       let hasNewIncoming = false, newAdded = false;
       let newestMs = 0;
+      const fragment = document.createDocumentFragment();
       for (const msg of data) {
         if (msg.id && Number(msg.id) > lastMessageId) lastMessageId = Number(msg.id);
         if (msg.timestamp_ms && Number(msg.timestamp_ms) > lastMessageTimestamp) lastMessageTimestamp = Number(msg.timestamp_ms);
         const key = String(msg.id);
         if (displayedMessages.has(key)) continue;
-        appendMessage(msg);
+        appendMessageToFragment(msg, fragment);
         displayedMessages.add(key);
         newAdded = true;
         if (msg.timestamp_ms) newestMs = Math.max(newestMs, Number(msg.timestamp_ms));
@@ -797,26 +866,41 @@
         }
       }
 
+      if (fragment.childNodes.length) {
+        requestAnimationFrame(() => {
+          messagesDiv.appendChild(fragment);
+          pruneOldMessages();
+          if (newAdded) {
+            if (forceScrollBottom) hardScrollToBottom();
+            else scheduleScrollToBottom(false);
+          } else if (forceScrollBottom) {
+            hardScrollToBottom();
+          }
+        });
+      } else if (forceScrollBottom) {
+        hardScrollToBottom();
+      }
+
       // Keep sidebar order in sync with latest message without refreshing the page
       if (updateSidebar && newestMs > 0) {
         if (currentGroupId) bumpConversation("group", currentGroupId, newestMs);
         else bumpConversation("user", currentReceiverId, newestMs);
       }
 
-      if (newAdded) {
-        if (forceScrollBottom) hardScrollToBottom();
-        else scrollToBottom(false);
-      } else if (forceScrollBottom) hardScrollToBottom();
-
       if (allowSound && !suppressSound && initialPaintDone && hasNewIncoming) {
         audioManager.play('message');
       }
       if (!initialPaintDone) initialPaintDone = true;
-    } catch (_) {}
+    } catch (_) {
+    } finally {
+      hideMessageSkeleton();
+      console.timeEnd("loadMessages");
+    }
   }
 
   // ====== Sidebar Badges Refresh ======
   async function refreshSidebarBadges() {
+    if (!badgeRefreshEnabled) return;
     try {
       const res = await fetch("/api/unread_counts", { cache: "no-store" });
       const data = await res.json().catch(() => ({}));
@@ -895,6 +979,17 @@
 
       reorderConversationList();
     } catch (_) {}
+  }
+
+  function startBadgePolling() {
+    if (badgePollIntervalId) return;
+    badgePollIntervalId = setInterval(() => refreshSidebarBadges(), BADGE_POLL_INTERVAL_MS);
+  }
+
+  function stopBadgePolling() {
+    if (!badgePollIntervalId) return;
+    clearInterval(badgePollIntervalId);
+    badgePollIntervalId = null;
   }
 
   function reorderConversationList() {
@@ -998,7 +1093,7 @@
       setTypingIndicator("");
       if (displayedMessages.has(key)) return;
       hideEmptyState();
-      appendMessage(msg);
+      appendMessageNow(msg);
       displayedMessages.add(key);
       if (msg.timestamp_ms && Number(msg.timestamp_ms) > lastMessageTimestamp) {
         lastMessageTimestamp = Number(msg.timestamp_ms);
@@ -1006,7 +1101,7 @@
       if (msg.id && Number(msg.id) > lastMessageId) {
         lastMessageId = Number(msg.id);
       }
-      scrollToBottom(false);
+      scheduleScrollToBottom(false);
       if (!suppressSound && initialPaintDone) {
         audioManager.play("message");
       }
@@ -1041,20 +1136,29 @@
     socket.emit("join_groups", { groups: groupIds });
   }
 
+  function getInitialGroupIds() {
+    const raw = bodyEl?.getAttribute("data-group-ids") || "[]";
+    try {
+      const ids = JSON.parse(raw);
+      return Array.isArray(ids) ? ids.map((id) => String(id)) : [];
+    } catch (_) {
+      return [];
+    }
+  }
+
   function initSocket() {
     if (!window.io) return;
+    if (socket) return;
     socket = window.io({ transports: ["websocket", "polling"] });
     socket.on("connect", () => {
       socketConnected = true;
-      const groupIds = Array.from(document.querySelectorAll('li.user-item[data-group-id]'))
-        .map((li) => li.getAttribute("data-group-id"))
-        .filter(Boolean);
+      const groupIds = getInitialGroupIds();
       joinGroupRooms(groupIds);
-      refreshSidebarBadges();
       renderNetStatus();
     });
     socket.on("disconnect", () => {
       socketConnected = false;
+      setTypingIndicator("");
       renderNetStatus();
     });
     socket.on("presence_state", (data) => {
@@ -1189,7 +1293,7 @@
       timestamp: new Date().toLocaleTimeString("ar-EG", { hour: "2-digit", minute: "2-digit" }),
       date: new Date().toISOString().split("T")[0],
     };
-    appendMessage(tempMsg);
+    appendMessageNow(tempMsg);
     displayedMessages.add(String(tempId));
     messageInput.value = "";
     hardScrollToBottom();
@@ -1319,7 +1423,7 @@
       const data = await res.json().catch(() => ({}));
       if (!res.ok || !data || data.status !== "ok") throw new Error((data?.error) || "فشل إرسال المرفق");
       if (data.message) {
-        appendMessage(data.message);
+        appendMessageNow(data.message);
         displayedMessages.add(String(data.message.id));
         hardScrollToBottom();
         showToast("✅ تم إرسال الملف بنجاح");
@@ -1362,7 +1466,7 @@
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "فشل إرسال الصوت");
       if (data.message) {
-        appendMessage(data.message);
+        appendMessageNow(data.message);
         displayedMessages.add(String(data.message.id));
         hardScrollToBottom();
         showToast("✅ تم إرسال التسجيل");
@@ -1423,7 +1527,7 @@
       const j = await res.json().catch(() => ({}));
       if (!res.ok || !j || j.status !== "ok") { showToast("❌ " + (j?.error || "فشل إرسال الصوت")); return; }
       if (j.message) {
-        appendMessage(j.message);
+        appendMessageNow(j.message);
         displayedMessages.add(String(j.message.id));
         hardScrollToBottom();
         showToast("✅ تم إرسال الملف الصوتي");
@@ -1483,6 +1587,14 @@
 
   // ====== Visibility Change ======
   document.addEventListener("visibilitychange", () => {
+    if (document.hidden) {
+      stopBadgePolling();
+      return;
+    }
+    if (badgeRefreshEnabled) {
+      startBadgePolling();
+      refreshSidebarBadges();
+    }
     if (!document.hidden && (currentReceiverId || currentGroupId)) {
       suppressSound = true;
       initialPaintDone = false;
@@ -1494,6 +1606,11 @@
 
   window.addEventListener("beforeunload", () => {
     if (typingActive) emitTyping(false);
+    if (badgePollTimeoutId) clearTimeout(badgePollTimeoutId);
+    stopBadgePolling();
+    if (typingTimer) clearTimeout(typingTimer);
+    if (typingHideTimer) clearTimeout(typingHideTimer);
+    try { socket?.disconnect(); } catch (_) {}
   });
 
   // ====== 🎯 Group Modals - Enhanced & Professional ======
@@ -1511,6 +1628,36 @@
   }
 
   // Create Group Modal
+  function renderGroupMembers(users, box) {
+    if (!box) return;
+    const fragment = document.createDocumentFragment();
+    users.forEach((user) => {
+      const label = document.createElement("label");
+      label.className = "member-row";
+      label.innerHTML = `
+        <input type="checkbox" value="${escapeHtml(String(user.id))}">
+        <span>${escapeHtml(user.name)} (${escapeHtml(user.phone_number || "")})</span>
+      `;
+      fragment.appendChild(label);
+    });
+    box.innerHTML = "";
+    box.appendChild(fragment);
+  }
+
+  async function ensureGroupMembersLoaded(box) {
+    if (!box || box.dataset.loaded === "1") return;
+    box.innerHTML = '<div class="members-loading"><span class="skeleton-line"></span><span class="skeleton-line"></span><span class="skeleton-line"></span></div>';
+    try {
+      const res = await fetch("/api/users", { cache: "no-store" });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data?.ok || !Array.isArray(data.users)) throw new Error("fetch_failed");
+      renderGroupMembers(data.users, box);
+      box.dataset.loaded = "1";
+    } catch (_) {
+      box.innerHTML = '<div class="members-loading error">تعذر تحميل الأعضاء. حاول مرة أخرى.</div>';
+    }
+  }
+
   function openCreateGroupModal() {
     const modal = document.getElementById("createGroupModal");
     const cancel = document.getElementById("createGroupCancel");
@@ -1521,6 +1668,7 @@
     
     modal.classList.remove("hidden");
     nameInput?.focus();
+    ensureGroupMembersLoaded(box);
     
     const close = () => {
       modal.classList.add("hidden");
@@ -1860,6 +2008,19 @@
     const bodyId = document.body.getAttribute("data-user-id");
     if (bodyId) currentUserId = parseInt(bodyId, 10);
 
+    if ("PerformanceObserver" in window) {
+      try {
+        const observer = new PerformanceObserver((list) => {
+          list.getEntries().forEach((entry) => {
+            if (entry.name === "first-contentful-paint") {
+              console.log("FCP:", entry.startTime.toFixed(0), "ms");
+            }
+          });
+        });
+        observer.observe({ type: "paint", buffered: true });
+      } catch (_) {}
+    }
+
     requestNotificationPermission();
     initNotificationSettingsUI();
     initSocket();
@@ -1896,7 +2057,11 @@
     } else {
       if (window.innerWidth <= 992) openDrawer();
     }
-    refreshSidebarBadges();
+    badgePollTimeoutId = setTimeout(() => {
+      badgeRefreshEnabled = true;
+      refreshSidebarBadges();
+      startBadgePolling();
+    }, BADGE_POLL_DELAY_MS);
     renderNetStatus();
   });
 
