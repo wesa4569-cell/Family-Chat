@@ -191,6 +191,59 @@ def _mark_user_offline(user_id: int):
         online_users[user_id] = count
 
 
+def _load_group_activity(uid: int):
+    memberships = GroupMember.query.filter_by(user_id=uid, status="accepted").all()
+    if not memberships:
+        return {}, {}
+
+    group_ids = [m.group_id for m in memberships]
+    blocked_ids = {
+        gid
+        for (gid,) in db.session.query(GroupBlock.group_id)
+        .filter(GroupBlock.user_id == uid, GroupBlock.group_id.in_(group_ids))
+        .all()
+    }
+    active_group_ids = [gid for gid in group_ids if gid not in blocked_ids]
+    if not active_group_ids:
+        return {}, {}
+
+    group_counts = {int(gid): 0 for gid in active_group_ids}
+    last_read_expr = func.coalesce(
+        GroupMember.last_read_at,
+        GroupMember.responded_at,
+        GroupMember.invited_at,
+    )
+    rows = (
+        db.session.query(GroupMessage.group_id, func.count(GroupMessage.id))
+        .join(GroupMember, GroupMember.group_id == GroupMessage.group_id)
+        .filter(
+            GroupMember.user_id == uid,
+            GroupMember.status == "accepted",
+            GroupMessage.group_id.in_(active_group_ids),
+            GroupMessage.sender_id != uid,
+            GroupMessage.timestamp > last_read_expr,
+        )
+        .group_by(GroupMessage.group_id)
+        .all()
+    )
+    for gid, cnt in rows:
+        group_counts[int(gid)] = int(cnt)
+
+    last_ts_groups = {}
+    rows = (
+        db.session.query(GroupMessage.group_id, func.max(GroupMessage.timestamp))
+        .filter(GroupMessage.group_id.in_(active_group_ids))
+        .group_by(GroupMessage.group_id)
+        .all()
+    )
+    for gid, mx in rows:
+        if gid is None or mx is None:
+            continue
+        last_ts_groups[int(gid)] = int(mx.timestamp() * 1000)
+
+    return group_counts, last_ts_groups
+
+
 # ----------------- Models -----------------
 class User(db.Model):
     __tablename__ = "users"
@@ -2392,19 +2445,12 @@ def api_unread_counts():
 
     # Unread counts for groups: messages newer than last_read_at
     group_counts = {}
+    last_ts_groups = {}
     try:
-        memberships = GroupMember.query.filter_by(user_id=uid, status="accepted").all()
-        for m in memberships:
-            if GroupBlock.query.filter_by(group_id=m.group_id, user_id=uid).first():
-                continue
-            last_read = getattr(m, "last_read_at", None) or m.responded_at or m.invited_at
-            q = GroupMessage.query.filter(GroupMessage.group_id == m.group_id)
-            q = q.filter(GroupMessage.sender_id != uid)
-            if last_read:
-                q = q.filter(GroupMessage.timestamp > last_read)
-            group_counts[int(m.group_id)] = int(q.count())
+        group_counts, last_ts_groups = _load_group_activity(uid)
     except Exception:
         group_counts = {}
+        last_ts_groups = {}
 
     # Latest interaction timestamp per conversation (to allow live reordering in sidebar)
     last_ts_users = {}
@@ -2425,28 +2471,6 @@ def api_unread_counts():
             last_ts_users[int(oid)] = int(mx.timestamp() * 1000)
     except Exception:
         last_ts_users = {}
-
-    last_ts_groups = {}
-    try:
-        memberships = GroupMember.query.filter_by(user_id=uid, status="accepted").all()
-        gids = [
-            m.group_id
-            for m in memberships
-            if not GroupBlock.query.filter_by(group_id=m.group_id, user_id=uid).first()
-        ]
-        if gids:
-            rows = (
-                db.session.query(GroupMessage.group_id, func.max(GroupMessage.timestamp))
-                .filter(GroupMessage.group_id.in_(gids))
-                .group_by(GroupMessage.group_id)
-                .all()
-            )
-            for gid, mx in rows:
-                if gid is None or mx is None:
-                    continue
-                last_ts_groups[int(gid)] = int(mx.timestamp() * 1000)
-    except Exception:
-        last_ts_groups = {}
 
     return jsonify({
         "ok": True,
@@ -2479,19 +2503,12 @@ def compute_unread_counts_for_user(uid: int):
 
     # Unread counts for groups: messages newer than last_read_at
     group_counts = {}
+    last_ts_groups = {}
     try:
-        memberships = GroupMember.query.filter_by(user_id=uid, status="accepted").all()
-        for m in memberships:
-            if GroupBlock.query.filter_by(group_id=m.group_id, user_id=uid).first():
-                continue
-            last_read = getattr(m, "last_read_at", None) or m.responded_at or m.invited_at
-            q = GroupMessage.query.filter(GroupMessage.group_id == m.group_id)
-            q = q.filter(GroupMessage.sender_id != uid)
-            if last_read:
-                q = q.filter(GroupMessage.timestamp > last_read)
-            group_counts[int(m.group_id)] = int(q.count())
+        group_counts, last_ts_groups = _load_group_activity(uid)
     except Exception:
         group_counts = {}
+        last_ts_groups = {}
 
     # Latest interaction timestamp per conversation (for sidebar reorder)
     last_ts_users = {}
@@ -2512,28 +2529,6 @@ def compute_unread_counts_for_user(uid: int):
             last_ts_users[int(oid)] = int(mx.timestamp() * 1000)
     except Exception:
         last_ts_users = {}
-
-    last_ts_groups = {}
-    try:
-        memberships = GroupMember.query.filter_by(user_id=uid, status="accepted").all()
-        gids = [
-            m.group_id
-            for m in memberships
-            if not GroupBlock.query.filter_by(group_id=m.group_id, user_id=uid).first()
-        ]
-        if gids:
-            rows = (
-                db.session.query(GroupMessage.group_id, func.max(GroupMessage.timestamp))
-                .filter(GroupMessage.group_id.in_(gids))
-                .group_by(GroupMessage.group_id)
-                .all()
-            )
-            for gid, mx in rows:
-                if gid is None or mx is None:
-                    continue
-                last_ts_groups[int(gid)] = int(mx.timestamp() * 1000)
-    except Exception:
-        last_ts_groups = {}
 
     return {
         "ok": True,
