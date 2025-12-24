@@ -108,7 +108,10 @@ def current_user():
     return db.session.get(User, uid)
 
 
-def _utc_ms(dt: datetime | None) -> int:
+from typing import Union
+from datetime import datetime
+
+def _utc_ms(dt: Union[datetime, None]) -> int:
     """Milliseconds since epoch. Treat naive datetimes as UTC to avoid TZ drift."""
     if not dt:
         return 0
