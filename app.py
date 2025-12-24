@@ -120,7 +120,12 @@ def _utc_ms(dt: Union[datetime, None]) -> int:
     return int(dt.timestamp() * 1000)
 
 
-def _utc_iso(dt: datetime | None) -> str | None:
+from typing import Union
+from datetime import datetime
+
+def _utc_iso(dt: Union[datetime, None]) -> Union[str, None]:
+    ...
+
     if not dt:
         return None
     if dt.tzinfo is None:
