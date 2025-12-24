@@ -56,10 +56,26 @@ app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1)
 # this makes Flask aware of the original scheme/host (needed for secure cookies, redirects, etc.).
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 
-# Security: use env var in production
-app.secret_key = os.environ.get("SECRET_KEY") or "dev-secret-key-change-in-production"
-
-# In production, you should set a strong SECRET_KEY via environment variables.
+# Security: use env var in production. If missing, persist a generated key under
+# instance/secret_key.txt so sessions do not break after restarts.
+_env_secret = os.environ.get("SECRET_KEY")
+if _env_secret:
+    app.secret_key = _env_secret
+else:
+    try:
+        os.makedirs(app.instance_path, exist_ok=True)
+        _secret_path = os.path.join(app.instance_path, "secret_key.txt")
+        if os.path.exists(_secret_path):
+            with open(_secret_path, "r", encoding="utf-8") as f:
+                app.secret_key = (f.read() or "").strip() or None
+        if not getattr(app, "secret_key", None):
+            import secrets
+            app.secret_key = secrets.token_urlsafe(64)
+            with open(_secret_path, "w", encoding="utf-8") as f:
+                f.write(app.secret_key)
+    except Exception:
+        # Fallback (not ideal): sessions may reset on restart.
+        app.secret_key = "dev-secret-key-change-in-production"
 
 
 # DB
@@ -81,6 +97,12 @@ app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 # إذا تستخدم HTTPS في الإنتاج فعّلها:
 # app.config["SESSION_COOKIE_SECURE"] = True
 
+# Keep sessions across browser restarts (required for PWA/Push reliability).
+# We do **not** store passwords on the device. Instead we keep an expiring
+# signed session cookie.
+app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=int(os.environ.get("SESSION_LIFETIME_DAYS", "30")))
+app.config["SESSION_REFRESH_EACH_REQUEST"] = True
+
 db = SQLAlchemy(app)
 socketio = SocketIO(
     app,
@@ -92,6 +114,21 @@ online_users = {}
 
 CONVERSATION_PREVIEW_LIMIT = 10
 MESSAGE_PAGE_LIMIT = 50
+
+
+@app.before_request
+def _refresh_login_session_cookie():
+    """Ensure the login session persists across browser restarts.
+
+    This sets Flask's session cookie to a *permanent* cookie when a user is
+    logged-in, so the PWA will not keep asking for credentials on every open.
+    """
+    try:
+        if session.get("user_id"):
+            session.permanent = True
+    except Exception:
+        # Never block a request due to session refresh issues.
+        pass
 
 
 # ----------------- Helpers -----------------
@@ -923,6 +960,7 @@ def login():
     if request.method == "POST":
         phone = (request.form.get("phone") or "").strip()
         password = request.form.get("password") or ""
+        remember = (request.form.get("remember") or "on").lower() in ("1", "true", "on", "yes")
 
         if not phone or not password:
             return render_template("login.html", error="جميع الحقول مطلوبة")
@@ -935,6 +973,8 @@ def login():
         session["user_id"] = user.id
         session["phone_number"] = user.phone_number
         session["name"] = user.name
+        # Make session persist across restarts when "remember" is enabled.
+        session.permanent = bool(remember)
 
         try:
             user.touch_last_seen()
