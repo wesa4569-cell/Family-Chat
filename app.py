@@ -19,6 +19,7 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
 from sqlalchemy import or_, and_, func, case
+from sqlalchemy.orm import joinedload
 from sqlalchemy.exc import SQLAlchemyError
 
 # Web Push (اختياري)
@@ -88,6 +89,9 @@ socketio = SocketIO(
 )
 
 online_users = {}
+
+CONVERSATION_PREVIEW_LIMIT = 10
+MESSAGE_PAGE_LIMIT = 50
 
 
 # ----------------- Helpers -----------------
@@ -225,6 +229,11 @@ class Message(db.Model):
 
     sender = db.relationship("User", foreign_keys=[sender_id], backref="sent_messages")
     receiver = db.relationship("User", foreign_keys=[receiver_id], backref="received_messages")
+
+    __table_args__ = (
+        db.Index("ix_messages_sender_receiver_ts", "sender_id", "receiver_id", "timestamp"),
+        db.Index("ix_messages_receiver_is_read", "receiver_id", "is_read"),
+    )
 
 class PushSubscription(db.Model):
     __tablename__ = "push_subscriptions"
@@ -604,6 +613,10 @@ class GroupMessage(db.Model):
     group = db.relationship("Group", foreign_keys=[group_id])
     sender = db.relationship("User", foreign_keys=[sender_id])
 
+    __table_args__ = (
+        db.Index("ix_group_messages_group_ts", "group_id", "timestamp"),
+    )
+
 
 
 @app.route("/favicon.ico")
@@ -735,63 +748,87 @@ def web_chat():
     except SQLAlchemyError:
         db.session.rollback()
 
-    # Users (غيري)
-    others = User.query.filter(User.id != user.id).all()
+    active_user = None
+    active_group = None
 
-    # Groups (accepted)
-    groups = (
-        db.session.query(Group)
+    active_id_raw = (request.args.get("user") or "").strip()
+    if active_id_raw:
+        try:
+            active_user = db.session.get(User, int(active_id_raw))
+        except ValueError:
+            active_user = None
+
+    active_group_raw = (request.args.get("group") or "").strip()
+    if active_group_raw:
+        try:
+            active_group = db.session.get(Group, int(active_group_raw))
+        except ValueError:
+            active_group = None
+
+    # Groups (accepted) with latest message timestamp
+    group_last_subq = (
+        db.session.query(
+            GroupMessage.group_id.label("group_id"),
+            func.max(GroupMessage.timestamp).label("last_ts"),
+        )
+        .group_by(GroupMessage.group_id)
+        .subquery()
+    )
+
+    group_rows = (
+        db.session.query(Group, group_last_subq.c.last_ts)
         .join(GroupMember, GroupMember.group_id == Group.id)
         .outerjoin(GroupBlock, and_(GroupBlock.group_id == Group.id, GroupBlock.user_id == user.id))
+        .outerjoin(group_last_subq, group_last_subq.c.group_id == Group.id)
         .filter(
             GroupMember.user_id == user.id,
             GroupMember.status == "accepted",
             GroupBlock.id == None  # noqa: E711
         )
-        .order_by(Group.created_at.desc())
+        .order_by(func.coalesce(group_last_subq.c.last_ts, Group.created_at).desc(), Group.id.desc())
         .all()
     )
 
     # إزالة تكرارات المجموعات (نفس الاسم لنفس المنشئ) - نعرض الأحدث فقط
     _seen = {}
-    for g in groups:
+    for g, last_ts in group_rows:
         key = (g.owner_id, (g.name or "").strip().lower())
-        if key not in _seen or (g.id or 0) > (_seen[key].id or 0):
-            _seen[key] = g
+        if key not in _seen or (g.id or 0) > (_seen[key][0].id or 0):
+            _seen[key] = (g, last_ts)
     groups = list(_seen.values())
-    groups.sort(key=lambda gg: (gg.created_at or datetime.now(timezone.utc).replace(tzinfo=None)), reverse=True)
 
-    # Last message timestamp per user
-    user_last_ts = {}
-    for u in others:
-        last_msg = (
-            Message.query.filter(
-                or_(
-                    and_(Message.sender_id == user.id, Message.receiver_id == u.id),
-                    and_(Message.sender_id == u.id, Message.receiver_id == user.id),
-                )
-            )
-            .order_by(Message.timestamp.desc(), Message.id.desc())
-            .first()
-        )
-        user_last_ts[u.id] = last_msg.timestamp if last_msg else None
+    # Direct message latest timestamps
+    other_id = case(
+        (Message.sender_id == user.id, Message.receiver_id),
+        else_=Message.sender_id,
+    )
+    dm_last_subq = (
+        db.session.query(other_id.label("other_id"), func.max(Message.timestamp).label("last_ts"))
+        .filter(or_(Message.sender_id == user.id, Message.receiver_id == user.id))
+        .group_by(other_id)
+        .subquery()
+    )
 
-    # Last message timestamp per group
-    group_last_ts = {}
-    for g in groups:
-        last_gm = (
-            GroupMessage.query.filter_by(group_id=g.id)
-            .order_by(GroupMessage.timestamp.desc(), GroupMessage.id.desc())
-            .first()
-        )
-        group_last_ts[g.id] = last_gm.timestamp if last_gm else None
+    dm_rows = (
+        db.session.query(User, dm_last_subq.c.last_ts)
+        .join(dm_last_subq, dm_last_subq.c.other_id == User.id)
+        .filter(User.id != user.id)
+        .order_by(dm_last_subq.c.last_ts.desc().nullslast(), User.id.desc())
+        .all()
+    )
 
     # Build conversations list (Users + Groups) then sort by latest
     conversations = []
-    for g in groups:
-        conversations.append({"type": "group", "group": g, "ts": group_last_ts.get(g.id) or g.created_at})
-    for u in others:
-        conversations.append({"type": "user", "user": u, "ts": user_last_ts.get(u.id)})
+    for g, last_ts in groups:
+        conversations.append({"type": "group", "group": g, "ts": last_ts or g.created_at})
+    for u, last_ts in dm_rows:
+        conversations.append({"type": "user", "user": u, "ts": last_ts})
+
+    # Ensure active conversation is present even if outside the preview list
+    if active_group and not any(c.get("type") == "group" and c.get("group").id == active_group.id for c in conversations):
+        conversations.append({"type": "group", "group": active_group, "ts": active_group.created_at})
+    if active_user and not any(c.get("type") == "user" and c.get("user").id == active_user.id for c in conversations):
+        conversations.append({"type": "user", "user": active_user, "ts": None})
 
     # ترتيب ثابت أولًا ثم حسب آخر رسالة (تنازليًا)
     conversations.sort(
@@ -805,38 +842,47 @@ def web_chat():
         reverse=True,
     )
 
-    # Active chat selection
-    active_user = None
-    active_group = None
-
-    active_id_raw = (request.args.get("user") or "").strip()
-    if active_id_raw:
-        try:
-            active_id = int(active_id_raw)
-            active_user = next((uu for uu in others if uu.id == active_id), None)
-        except ValueError:
-            active_user = None
-
-    active_group_raw = (request.args.get("group") or "").strip()
-    if active_group_raw:
-        try:
-            gid = int(active_group_raw)
-            active_group = next((gg for gg in groups if gg.id == gid), None)
-        except ValueError:
-            active_group = None
+    if CONVERSATION_PREVIEW_LIMIT and len(conversations) > CONVERSATION_PREVIEW_LIMIT:
+        limited = conversations[:CONVERSATION_PREVIEW_LIMIT]
+        active_entries = []
+        if active_group:
+            active_entries = [c for c in conversations if c.get("type") == "group" and c.get("group").id == active_group.id]
+        if not active_entries and active_user:
+            active_entries = [c for c in conversations if c.get("type") == "user" and c.get("user").id == active_user.id]
+        if active_entries and active_entries[0] not in limited:
+            limited.pop(-1)
+            limited.append(active_entries[0])
+            limited.sort(
+                key=lambda it: (it.get("ts") is not None, it.get("ts") or datetime.min),
+                reverse=True,
+            )
+        conversations = limited
 
     pending_group_invites = (
-        GroupMember.query
+        GroupMember.query.options(joinedload(GroupMember.group))
         .filter_by(user_id=user.id, status="pending")
         .order_by(GroupMember.invited_at.desc())
         .all()
     )
 
+    group_ids = [
+        gid for (gid,) in (
+            db.session.query(GroupMember.group_id)
+            .outerjoin(GroupBlock, and_(GroupBlock.group_id == GroupMember.group_id, GroupBlock.user_id == user.id))
+            .filter(
+                GroupMember.user_id == user.id,
+                GroupMember.status == "accepted",
+                GroupBlock.id == None  # noqa: E711
+            )
+            .all()
+        )
+    ]
+
     return render_template(
         "chat.html",
         current_user=user,
-        users=others,
-        groups=groups,
+        users=[],
+        groups=[g for g, _ in groups],
         conversations=conversations,
         pending_group_invites=[
             {
@@ -849,7 +895,8 @@ def web_chat():
         ],
         active_user=active_user,
         active_group=active_group,
-        phone_number=user.phone_number
+        phone_number=user.phone_number,
+        group_ids=group_ids
     )
 
 
@@ -965,6 +1012,34 @@ def get_group_invites():
             "invited_by": gm.invited_by
         })
     return jsonify({"ok": True, "invites": out})
+
+
+@app.route("/api/users")
+def api_users():
+    if not login_required():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    me = current_user()
+    if not me:
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+    users = (
+        User.query
+        .filter(User.id != me.id)
+        .order_by(User.name.asc(), User.id.asc())
+        .all()
+    )
+    return jsonify({
+        "ok": True,
+        "users": [
+            {
+                "id": u.id,
+                "name": u.name,
+                "phone_number": u.phone_number,
+                "avatar_url": url_for("static", filename=f"profile_pics/{u.profile_pic or 'default.png'}"),
+            }
+            for u in users
+        ]
+    })
 
 
 @app.route("/api/groups/respond", methods=["POST"])
@@ -1164,6 +1239,15 @@ def get_group_messages(group_id: int):
         return jsonify({"ok": False, "error": "forbidden"}), 403
 
     last_id = (request.args.get("last_id") or "0").strip()
+    limit_raw = request.args.get("limit", str(MESSAGE_PAGE_LIMIT))
+    try:
+        limit = int(limit_raw)
+    except ValueError:
+        limit = MESSAGE_PAGE_LIMIT
+    if limit < 20:
+        limit = 20
+    if limit > 200:
+        limit = 200
     min_id = 0
     try:
         if int(last_id) > 0:
@@ -1171,10 +1255,15 @@ def get_group_messages(group_id: int):
     except ValueError:
         pass
 
-    q = GroupMessage.query.filter(GroupMessage.group_id == group_id)
-    if min_id:
+    q = GroupMessage.query.filter(GroupMessage.group_id == group_id).options(joinedload(GroupMessage.sender))
+
+    is_initial = min_id == 0
+    if is_initial:
+        msgs_desc = q.order_by(GroupMessage.timestamp.desc(), GroupMessage.id.desc()).limit(limit).all()
+        messages = list(reversed(msgs_desc))
+    else:
         q = q.filter(GroupMessage.id > min_id)
-    messages = q.order_by(GroupMessage.timestamp.asc()).all()
+        messages = q.order_by(GroupMessage.timestamp.asc(), GroupMessage.id.asc()).all()
 
     res = []
     for m in messages:
@@ -1587,7 +1676,7 @@ def get_messages(other_user_id: int):
 
     since_ms = request.args.get("since", "0")
     last_id = request.args.get("last_id", "0")
-    limit_raw = request.args.get("limit", "200")
+    limit_raw = request.args.get("limit", str(MESSAGE_PAGE_LIMIT))
 
     # حدّ آمن
     try:
@@ -1596,8 +1685,8 @@ def get_messages(other_user_id: int):
         limit = 200
     if limit < 20:
         limit = 20
-    if limit > 500:
-        limit = 500
+    if limit > 200:
+        limit = 200
 
     last_load_time = datetime(1970, 1, 1)
     min_id = 0
