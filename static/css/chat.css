@@ -304,7 +304,20 @@ html, body {
   font-size: 11px;
   opacity: 0.75;
   margin-top: 4px;
-  display: block;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.msg-status{
+  display:inline-flex;
+  align-items:center;
+  gap:2px;
+  font-size: 14px;
+  line-height: 1;
+}
+.msg-status.read{
+  opacity: 0.95;
 }
 
 /* فاصل التاريخ */
@@ -492,6 +505,20 @@ html, body {
   display:flex;
   align-items:center;
   gap:10px;
+}
+.chat-title-block{
+  display:flex;
+  flex-direction:column;
+  line-height:1.15;
+  min-width:0;
+}
+.chat-subtitle{
+  font-size:12px;
+  opacity:0.85;
+  margin-top:2px;
+  white-space:nowrap;
+  overflow:hidden;
+  text-overflow:ellipsis;
 }
 .chat-avatar{
   width:38px;

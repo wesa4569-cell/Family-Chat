@@ -97,6 +97,7 @@
   const receiverInput = document.getElementById("receiver-id");
   const groupInput = document.getElementById("group-id");
   const chatTitle = document.getElementById("chat-title");
+  const chatSubtitle = document.getElementById("chat-subtitle");
   const chatTitleWrap = document.querySelector(".chat-title-wrap");
   const netStatus = document.getElementById("netStatus");
   const logoutBtn = document.getElementById("logout-btn");
@@ -122,6 +123,9 @@
   const bodyEl = document.body;
 
   if (!messagesDiv || !form || !messageInput || !receiverInput) return;
+
+  // Cache last seen values for quick subtitle rendering
+  const lastSeenByUserId = new Map();
 
   // ====== 🔊 Notifications Audio Manager ======
   const AUDIO_STORAGE_KEY = "chat_notification_audio_v1";
@@ -637,6 +641,21 @@
     pruneOldMessages();
   }
 
+  function buildStatusHtml(msg, isSent, isGroup) {
+    // WhatsApp-like ticks for direct messages only.
+    if (!isSent) return "";
+    if (isGroup) return "";
+    const isRead = Boolean(msg.read_at || msg.is_read);
+    const isDelivered = Boolean(msg.delivered_at) || isRead;
+    if (isRead) {
+      return `<span class="msg-status read" title="مقروءة"><i class="bi bi-check2-all"></i></span>`;
+    }
+    if (isDelivered) {
+      return `<span class="msg-status" title="تم التسليم"><i class="bi bi-check2-all"></i></span>`;
+    }
+    return `<span class="msg-status" title="تم الإرسال"><i class="bi bi-check2"></i></span>`;
+  }
+
   function buildMessageInner(msg, isSent) {
     const t = escapeHtml(formatLocalTime(msg.timestamp_ms || 0) || (msg.timestamp ?? ""));
     const type = (msg.message_type || msg.type || "text");
@@ -644,26 +663,28 @@
     const isGroup = Boolean(currentGroupId || msg.group_id);
     const senderName = (msg.sender_name || msg.sender || "").trim();
     const senderLine = (isGroup && !isSent && senderName) ? `<div class="msg-sender">${escapeHtml(senderName)}</div>` : "";
+    const statusHtml = buildStatusHtml(msg, isSent, isGroup);
+    const timeLine = `<div class="message-time">${t}${statusHtml}</div>`;
 
     if (type === "image" && mediaUrl) {
       const safeUrl = escapeHtml(mediaUrl);
-      return `${senderLine}<div class="media-wrap"><a href="${safeUrl}" target="_blank" rel="noopener"><img class="msg-image" src="${safeUrl}" alt="image" loading="lazy"></a></div><div class="message-time">${t}</div>`;
+      return `${senderLine}<div class="media-wrap"><a href="${safeUrl}" target="_blank" rel="noopener"><img class="msg-image" src="${safeUrl}" alt="image" loading="lazy"></a></div>${timeLine}`;
     }
     if (type === "audio" && mediaUrl) {
       const safeUrl = escapeHtml(mediaUrl);
-      return `${senderLine}<div class="media-wrap"><audio controls preload="none" src="${safeUrl}"></audio></div><div class="message-time">${t}</div>`;
+      return `${senderLine}<div class="media-wrap"><audio controls preload="none" src="${safeUrl}"></audio></div>${timeLine}`;
     }
     if ((type === "video" || (type === "file" && (msg.media_mime || "").toLowerCase().startsWith("video/"))) && mediaUrl) {
       const safeUrl = escapeHtml(mediaUrl);
-      return `${senderLine}<div class="media-wrap"><video controls preload="metadata" src="${safeUrl}" style="max-width:100%;border-radius:12px;"></video></div><div class="message-time">${t}</div>`;
+      return `${senderLine}<div class="media-wrap"><video controls preload="metadata" src="${safeUrl}" style="max-width:100%;border-radius:12px;"></video></div>${timeLine}`;
     }
     if (type === "file" && mediaUrl) {
       const safeUrl = escapeHtml(mediaUrl);
       const fname = escapeHtml(msg.content || "ملف");
       const mime2 = escapeHtml(msg.media_mime || "");
-      return `${senderLine}<div class="file-wrap"><a class="file-link" href="${safeUrl}" target="_blank" rel="noopener"><i class="bi bi-paperclip"></i><span class="file-name">${fname}</span></a>${mime2 ? `<div class="file-mime">${mime2}</div>` : ``}</div><div class="message-time">${t}</div>`;
+      return `${senderLine}<div class="file-wrap"><a class="file-link" href="${safeUrl}" target="_blank" rel="noopener"><i class="bi bi-paperclip"></i><span class="file-name">${fname}</span></a>${mime2 ? `<div class="file-mime">${mime2}</div>` : ``}</div>${timeLine}`;
     }
-    return `${senderLine}<div>${escapeHtml(msg.content || "")}</div><div class="message-time">${t}</div>`;
+    return `${senderLine}<div>${escapeHtml(msg.content || "")}</div>${timeLine}`;
   }
 
   function pruneOldMessages() {
@@ -1060,6 +1081,58 @@
     netStatus.textContent = "";
   }
 
+  function formatLastSeen(iso) {
+    if (!iso) return "";
+    try {
+      const d = new Date(iso);
+      if (Number.isNaN(d.getTime())) return "";
+      const now = new Date();
+      const dateKey = d.toISOString().split("T")[0];
+      const todayKey = now.toISOString().split("T")[0];
+      const yKey = new Date(now.getTime() - 86400000).toISOString().split("T")[0];
+      const timeStr = d.toLocaleTimeString("ar-EG", { hour: "2-digit", minute: "2-digit" });
+      if (dateKey === todayKey) return `آخر ظهور اليوم ${timeStr}`;
+      if (dateKey === yKey) return `آخر ظهور أمس ${timeStr}`;
+      const dateStr = d.toLocaleDateString("ar-EG", { day: "numeric", month: "long" });
+      return `آخر ظهور ${dateStr} ${timeStr}`;
+    } catch (_) {
+      return "";
+    }
+  }
+
+  async function refreshActivePresence(forceFetch = false) {
+    if (!chatSubtitle) return;
+    if (!currentReceiverId) {
+      chatSubtitle.textContent = "";
+      return;
+    }
+    const uid = String(currentReceiverId);
+    const isOnline = onlineUsers.has(uid);
+    if (isOnline) {
+      chatSubtitle.textContent = "متصل الآن";
+      return;
+    }
+    const cached = lastSeenByUserId.get(uid);
+    if (cached && !forceFetch) {
+      chatSubtitle.textContent = formatLastSeen(cached) || "غير متصل";
+      return;
+    }
+    try {
+      const res = await fetch(`/api/users/${encodeURIComponent(uid)}/presence`, { credentials: "same-origin" });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data?.ok) {
+        if (data.last_seen) lastSeenByUserId.set(uid, data.last_seen);
+        if (data.online) {
+          chatSubtitle.textContent = "متصل الآن";
+        } else {
+          chatSubtitle.textContent = formatLastSeen(data.last_seen) || "غير متصل";
+        }
+        return;
+      }
+    } catch (_) {}
+    chatSubtitle.textContent = "غير متصل";
+  }
+
   function handleTypingEvent(data) {
     if (!data || String(data.sender_id) === String(currentUserId)) return;
     if (data.group_id) {
@@ -1180,6 +1253,38 @@
       else onlineUsers.delete(String(id));
       setUserOnlineState(id, isOnline);
       renderNetStatus();
+      if (String(id) === String(currentReceiverId)) {
+        refreshActivePresence(true);
+      }
+    });
+    socket.on("message_status", (data) => {
+      try {
+        if (!data || data.type !== "dm") return;
+        const status = data.status;
+        const ids = Array.isArray(data.message_ids) ? data.message_ids : [];
+        if (ids.length === 0) return;
+        ids.forEach((mid) => {
+          const el = document.querySelector(`.message.sender[data-msg-id="${mid}"]`);
+          if (!el) return;
+          // Update stored attrs for re-render safety
+          if (status === "delivered") el.dataset.deliveredAt = data.at || data.delivered_at || "1";
+          if (status === "read") el.dataset.readAt = data.at || data.read_at || "1";
+          // Update ticks inside the time line
+          const timeEl = el.querySelector(".message-time");
+          if (!timeEl) return;
+          const existing = timeEl.querySelector(".msg-status");
+          let html = "";
+          if (status === "read") {
+            html = `<span class="msg-status read" title="مقروءة"><i class="bi bi-check2-all"></i></span>`;
+          } else if (status === "delivered") {
+            html = `<span class="msg-status" title="تم التسليم"><i class="bi bi-check2-all"></i></span>`;
+          } else {
+            html = `<span class="msg-status" title="تم الإرسال"><i class="bi bi-check2"></i></span>`;
+          }
+          if (existing) existing.outerHTML = html;
+          else timeEl.insertAdjacentHTML("beforeend", html);
+        });
+      } catch (_) {}
     });
     socket.on("typing", handleTypingEvent);
     socket.on("new_message", handleIncomingMessage);
@@ -1227,6 +1332,7 @@
     currentReceiverId = String(userId);
     receiverInput.value = String(userId);
     if (chatTitle) chatTitle.textContent = userName || "محادثة";
+    if (chatSubtitle) chatSubtitle.textContent = "";
     const chatAvatar = document.getElementById("chat-avatar");
     const li = document.querySelector(`li[data-user-id="${userId}"]`);
     const av = li?.getAttribute("data-avatar");
@@ -1236,6 +1342,7 @@
     }
     resetConversation();
     updateGroupActionsVisibility();
+    refreshActivePresence(true);
     loadMessages({ allowSound: false, forceScrollBottom: true, updateSidebar: false }).then(() => {
       hardScrollToBottom();
       setTimeout(() => { suppressSound = false; }, 250);
@@ -1257,6 +1364,8 @@
     currentReceiverId = null;
     if (receiverInput) receiverInput.value = "";
     if (chatTitle) chatTitle.textContent = groupName || "مجموعة";
+    if (chatSubtitle) chatSubtitle.textContent = "";
+    if (chatSubtitle) chatSubtitle.textContent = "";
     const chatAvatar = document.getElementById("chat-avatar");
     if (chatAvatar) {
       chatAvatar.src = "";
@@ -2053,6 +2162,7 @@
       });
 
       renderNetStatus();
+      refreshActivePresence(true);
       closeDrawer();
     } else {
       if (window.innerWidth <= 992) openDrawer();

@@ -160,10 +160,31 @@ def _serialize_message(msg, sender_name: Optional[str] = None) -> dict:
         "message_type": getattr(msg, "message_type", "text"),
         "media_url": getattr(msg, "media_url", None),
         "media_mime": getattr(msg, "media_mime", None),
+        "is_read": getattr(msg, "is_read", False),
+        "delivered_at": _utc_iso(getattr(msg, "delivered_at", None)),
+        "read_at": _utc_iso(getattr(msg, "read_at", None)),
+        "edited_at": _utc_iso(getattr(msg, "edited_at", None)),
+        "deleted_for_all": bool(getattr(msg, "deleted_for_all", False)),
+        "reply_to_id": getattr(msg, "reply_to_id", None),
+        "forwarded": bool(getattr(msg, "forwarded", False)),
     }
 
 
 def _emit_direct_message(msg):
+    # If receiver is online at the moment of emit, mark as delivered.
+    try:
+        if msg.receiver_id in online_users and getattr(msg, "delivered_at", None) is None:
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
+            msg.delivered_at = now
+            db.session.commit()
+            socketio.emit(
+                "message_status",
+                {"type": "dm", "status": "delivered", "message_ids": [int(msg.id)], "at": _utc_iso(now)},
+                room=f"user_{msg.sender_id}",
+            )
+    except Exception:
+        db.session.rollback()
+
     payload = _serialize_message(msg)
     socketio.emit("new_message", {"type": "dm", "message": payload}, room=f"user_{msg.receiver_id}")
     socketio.emit("refresh_unread", {"type": "dm", "message_id": msg.id}, room=f"user_{msg.receiver_id}")
@@ -280,6 +301,14 @@ class Message(db.Model):
     timestamp = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None), index=True)
     is_read = db.Column(db.Boolean, default=False)
 
+    # WhatsApp-like status metadata (backward-compatible additions)
+    delivered_at = db.Column(db.DateTime, nullable=True, index=True)
+    read_at = db.Column(db.DateTime, nullable=True, index=True)
+    edited_at = db.Column(db.DateTime, nullable=True, index=True)
+    deleted_for_all = db.Column(db.Boolean, default=False, index=True)
+    reply_to_id = db.Column(db.Integer, nullable=True, index=True)
+    forwarded = db.Column(db.Boolean, default=False, index=True)
+
     sender = db.relationship("User", foreign_keys=[sender_id], backref="sent_messages")
     receiver = db.relationship("User", foreign_keys=[receiver_id], backref="received_messages")
 
@@ -304,15 +333,71 @@ class PushSubscription(db.Model):
     __table_args__ = (db.UniqueConstraint('user_id', 'endpoint', name='uq_push_user_endpoint'),)
 
 
+class MessageReaction(db.Model):
+    __tablename__ = "message_reactions"
+
+    id = db.Column(db.Integer, primary_key=True)
+    message_id = db.Column(db.Integer, nullable=False, index=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False, index=True)
+    emoji = db.Column(db.String(32), nullable=False)
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None), index=True)
+
+    user = db.relationship("User", foreign_keys=[user_id])
+
+    __table_args__ = (
+        db.UniqueConstraint("message_id", "user_id", "emoji", name="uq_react_msg_user_emoji"),
+        db.Index("ix_react_msg_user", "message_id", "user_id"),
+    )
+
+
 # ----------------- Socket.IO Events -----------------
 @socketio.on("connect")
 def handle_socket_connect():
     user_id = session.get("user_id")
     if not user_id:
         return
+    # Touch last_seen on connect
+    try:
+        u = db.session.get(User, user_id)
+        if u:
+            u.touch_last_seen()
+            db.session.commit()
+    except Exception:
+        db.session.rollback()
+
     _mark_user_online(user_id)
     join_room(f"user_{user_id}")
     emit("presence_state", {"online_user_ids": list(online_users.keys())})
+
+    # Mark undelivered direct messages to this user as delivered
+    try:
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        undelivered = (
+            Message.query
+            .filter(Message.receiver_id == user_id)
+            .filter(or_(Message.delivered_at == None, Message.delivered_at.is_(None)))  # noqa: E711
+            .all()
+        )
+        if undelivered:
+            by_sender: dict[int, list[int]] = {}
+            for m in undelivered:
+                # do not mark self-sent messages
+                if m.sender_id == user_id:
+                    continue
+                m.delivered_at = now
+                by_sender.setdefault(int(m.sender_id), []).append(int(m.id))
+            db.session.commit()
+            # notify senders about delivery
+            for sid, ids in by_sender.items():
+                socketio.emit(
+                    "message_status",
+                    {"type": "dm", "status": "delivered", "message_ids": ids, "at": _utc_iso(now)},
+                    room=f"user_{sid}",
+                )
+    except Exception:
+        db.session.rollback()
+
+    # (delivery marking handled above)
 
 
 @socketio.on("disconnect")
@@ -320,6 +405,13 @@ def handle_socket_disconnect():
     user_id = session.get("user_id")
     if not user_id:
         return
+    try:
+        u = db.session.get(User, user_id)
+        if u:
+            u.touch_last_seen()
+            db.session.commit()
+    except Exception:
+        db.session.rollback()
     _mark_user_offline(user_id)
 
 
@@ -671,6 +763,83 @@ class GroupMessage(db.Model):
     )
 
 
+# ----------------- DB schema safety (no Alembic) -----------------
+def _db_is_sqlite() -> bool:
+    try:
+        return db.engine.dialect.name == "sqlite"
+    except Exception:
+        return False
+
+
+def _ensure_columns_sqlite(table: str, columns: list[tuple[str, str]]):
+    """Add missing columns to an existing SQLite table.
+
+    NOTE: SQLite supports ALTER TABLE ADD COLUMN (at the end). We keep defaults simple
+    and NULL-friendly to avoid breaking running deployments.
+    """
+    try:
+        rows = db.session.execute(db.text(f"PRAGMA table_info({table});")).fetchall()
+        existing = {r[1] for r in rows}  # name is 2nd field
+        for name, decl in columns:
+            if name in existing:
+                continue
+            db.session.execute(db.text(f"ALTER TABLE {table} ADD COLUMN {name} {decl};"))
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+
+
+def _ensure_columns_postgres(table: str, columns: list[tuple[str, str]]):
+    try:
+        for name, decl in columns:
+            db.session.execute(db.text(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {name} {decl};"))
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+
+
+_schema_checked = False
+
+@app.before_request
+def _ensure_schema_once():
+    """Ensure new columns/tables exist without requiring a migration tool."""
+    global _schema_checked
+    if _schema_checked:
+        return
+    _schema_checked = True
+
+    try:
+        db.create_all()
+    except Exception:
+        # If create_all fails (permissions etc.), we still try to continue.
+        pass
+
+    # Add columns for Message (WhatsApp-like status/reply/forward/edit/delete)
+    msg_cols = [
+        ("delivered_at", "DATETIME"),
+        ("read_at", "DATETIME"),
+        ("edited_at", "DATETIME"),
+        ("deleted_for_all", "BOOLEAN DEFAULT 0"),
+        ("reply_to_id", "INTEGER"),
+        ("forwarded", "BOOLEAN DEFAULT 0"),
+    ]
+
+    # SQLite vs Postgres declarations
+    if _db_is_sqlite():
+        _ensure_columns_sqlite("messages", msg_cols)
+    else:
+        pg_cols = [
+            ("delivered_at", "TIMESTAMP"),
+            ("read_at", "TIMESTAMP"),
+            ("edited_at", "TIMESTAMP"),
+            ("deleted_for_all", "BOOLEAN DEFAULT FALSE"),
+            ("reply_to_id", "INTEGER"),
+            ("forwarded", "BOOLEAN DEFAULT FALSE"),
+        ]
+        _ensure_columns_postgres("messages", pg_cols)
+
+
+
 
 @app.route("/favicon.ico")
 def favicon():
@@ -951,6 +1120,21 @@ def web_chat():
         phone_number=user.phone_number,
         group_ids=group_ids
     )
+
+
+@app.route("/api/users/<int:user_id>/presence")
+def api_user_presence(user_id: int):
+    if not login_required():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    u = db.session.get(User, user_id)
+    if not u:
+        return jsonify({"ok": False, "error": "not_found"}), 404
+    return jsonify({
+        "ok": True,
+        "user_id": user_id,
+        "online": bool(user_id in online_users),
+        "last_seen": _utc_iso(u.last_seen),
+    })
 
 
 
@@ -1785,33 +1969,33 @@ def get_messages(other_user_id: int):
 
         msgs = query.order_by(Message.timestamp.asc(), Message.id.asc()).all()
 
-    # Mark unread messages (received by me)
+    # Mark unread messages (received by me) as read + emit read receipts to sender
     try:
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        changed_ids_by_sender: dict[int, list[int]] = {}
         changed = False
         for m in msgs:
             if m.receiver_id == me and not m.is_read:
                 m.is_read = True
+                # keep read_at synced
+                try:
+                    m.read_at = now
+                except Exception:
+                    pass
+                changed_ids_by_sender.setdefault(int(m.sender_id), []).append(int(m.id))
                 changed = True
         if changed:
             db.session.commit()
+            for sid, mids in changed_ids_by_sender.items():
+                socketio.emit(
+                    "message_status",
+                    {"type": "dm", "status": "read", "message_ids": mids, "at": _utc_iso(now)},
+                    room=f"user_{sid}",
+                )
     except SQLAlchemyError:
         db.session.rollback()
 
-    return jsonify([
-        {
-            "id": m.id,
-            "sender_id": m.sender_id,
-            "receiver_id": m.receiver_id,
-            "content": m.content,
-            "timestamp_iso": (m.timestamp.replace(tzinfo=timezone.utc).isoformat().replace("+00:00","Z") if m.timestamp else None),
-            "timestamp_ms": int((m.timestamp.replace(tzinfo=timezone.utc).timestamp()) * 1000) if m.timestamp else 0,
-            "is_read": m.is_read,
-            "message_type": getattr(m, "message_type", "text"),
-            "media_url": getattr(m, "media_url", None),
-            "media_mime": getattr(m, "media_mime", None),
-        }
-        for m in msgs
-    ])
+    return jsonify([_serialize_message(m) for m in msgs])
 
 
 @app.route("/send_message", methods=["POST"])
@@ -1860,20 +2044,7 @@ def send_message():
 
         _emit_direct_message(msg)
 
-        return jsonify({
-            "status": "ok",
-            "message": {
-                "id": msg.id,
-                "sender_id": msg.sender_id,
-                "receiver_id": msg.receiver_id,
-                "content": msg.content,
-                "timestamp_iso": _utc_iso(msg.timestamp),
-                "timestamp_ms": _utc_ms(msg.timestamp),
-                "message_type": getattr(msg, "message_type", "text"),
-                "media_url": getattr(msg, "media_url", None),
-                "media_mime": getattr(msg, "media_mime", None),
-            }
-        })
+        return jsonify({"status": "ok", "message": _serialize_message(msg)})
     except SQLAlchemyError:
         db.session.rollback()
         app.logger.exception("Send message error")
@@ -1954,21 +2125,7 @@ def send_image():
 
         _emit_direct_message(msg)
 
-        return jsonify({
-            "status": "ok",
-            "message": {
-                "id": msg.id,
-                "sender_id": msg.sender_id,
-                "receiver_id": msg.receiver_id,
-                "content": msg.content,
-                "timestamp_iso": _utc_iso(msg.timestamp),
-                "timestamp_ms": _utc_ms(msg.timestamp),
-                "is_read": msg.is_read,
-                "message_type": msg.message_type,
-                "media_url": msg.media_url,
-                "media_mime": msg.media_mime,
-            }
-        })
+        return jsonify({"status": "ok", "message": _serialize_message(msg)})
     except SQLAlchemyError:
         db.session.rollback()
         app.logger.exception("Send image error")
@@ -2049,21 +2206,7 @@ def send_audio():
 
         _emit_direct_message(msg)
 
-        return jsonify({
-            "status": "ok",
-            "message": {
-                "id": msg.id,
-                "sender_id": msg.sender_id,
-                "receiver_id": msg.receiver_id,
-                "content": msg.content,
-                "timestamp_iso": _utc_iso(msg.timestamp),
-                "timestamp_ms": _utc_ms(msg.timestamp),
-                "is_read": msg.is_read,
-                "message_type": msg.message_type,
-                "media_url": msg.media_url,
-                "media_mime": msg.media_mime,
-            }
-        })
+        return jsonify({"status": "ok", "message": _serialize_message(msg)})
     except SQLAlchemyError:
         db.session.rollback()
         app.logger.exception("Send audio error")
@@ -2144,21 +2287,7 @@ def send_file():
 
         _emit_direct_message(msg)
 
-        return jsonify({
-            "status": "ok",
-            "message": {
-                "id": msg.id,
-                "sender_id": msg.sender_id,
-                "receiver_id": msg.receiver_id,
-                "content": msg.content,
-                "timestamp_iso": _utc_iso(msg.timestamp),
-                "timestamp_ms": _utc_ms(msg.timestamp),
-                "is_read": msg.is_read,
-                "message_type": msg.message_type,
-                "media_url": msg.media_url,
-                "media_mime": msg.media_mime,
-            }
-        })
+        return jsonify({"status": "ok", "message": _serialize_message(msg)})
     except SQLAlchemyError:
         db.session.rollback()
         app.logger.exception("Send file error")
