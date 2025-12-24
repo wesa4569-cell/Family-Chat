@@ -317,7 +317,8 @@
     </div>
   </div>
   
-   <script defer src="{{ url_for('static', filename='js/chat.js') }}?v=15"></script>
+  <script src="https://cdn.socket.io/4.7.5/socket.io.min.js" crossorigin="anonymous"></script>
+   <script defer src="{{ url_for('static', filename='js/chat.js') }}?v=16"></script>
 <audio id="notifySound" preload="auto">
   <source src="{{ url_for('static', filename='sounds/notify.wav') }}" type="audio/wav">
 </audio>

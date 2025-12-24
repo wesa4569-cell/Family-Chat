@@ -14,6 +14,7 @@ from flask import (
     session, jsonify, send_from_directory, abort, make_response
 )
 from flask_sqlalchemy import SQLAlchemy
+from flask_socketio import SocketIO, emit, join_room
 from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
@@ -80,6 +81,13 @@ app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 # app.config["SESSION_COOKIE_SECURE"] = True
 
 db = SQLAlchemy(app)
+socketio = SocketIO(
+    app,
+    cors_allowed_origins="*",
+    async_mode=os.environ.get("SOCKETIO_ASYNC_MODE", "threading"),
+)
+
+online_users = {}
 
 
 # ----------------- Helpers -----------------
@@ -108,7 +116,7 @@ def current_user():
     return db.session.get(User, uid)
 
 
-from typing import Union
+from typing import Optional, Union
 from datetime import datetime
 
 def _utc_ms(dt: Union[datetime, None]) -> int:
@@ -120,9 +128,6 @@ def _utc_ms(dt: Union[datetime, None]) -> int:
     return int(dt.timestamp() * 1000)
 
 
-from typing import Union
-from datetime import datetime
-
 def _utc_iso(dt: Union[datetime, None]) -> Union[str, None]:
     ...
 
@@ -131,6 +136,55 @@ def _utc_iso(dt: Union[datetime, None]) -> Union[str, None]:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.isoformat().replace("+00:00", "Z")
+
+
+def _serialize_message(msg, sender_name: Optional[str] = None) -> dict:
+    if sender_name is None:
+        sender = getattr(msg, "sender", None)
+        if not sender:
+            sender = db.session.get(User, getattr(msg, "sender_id", None))
+        sender_name = sender.name if sender else ""
+    return {
+        "id": msg.id,
+        "sender_id": getattr(msg, "sender_id", None),
+        "receiver_id": getattr(msg, "receiver_id", None),
+        "group_id": getattr(msg, "group_id", None),
+        "sender_name": sender_name or "",
+        "content": msg.content,
+        "timestamp_iso": _utc_iso(msg.timestamp),
+        "timestamp_ms": _utc_ms(msg.timestamp),
+        "message_type": getattr(msg, "message_type", "text"),
+        "media_url": getattr(msg, "media_url", None),
+        "media_mime": getattr(msg, "media_mime", None),
+    }
+
+
+def _emit_direct_message(msg):
+    payload = _serialize_message(msg)
+    socketio.emit("new_message", {"type": "dm", "message": payload}, room=f"user_{msg.receiver_id}")
+    socketio.emit("refresh_unread", {"type": "dm", "message_id": msg.id}, room=f"user_{msg.receiver_id}")
+
+
+def _emit_group_message(msg):
+    payload = _serialize_message(msg)
+    socketio.emit("new_message", {"type": "group", "message": payload}, room=f"group_{msg.group_id}")
+    socketio.emit("refresh_unread", {"type": "group", "group_id": msg.group_id}, room=f"group_{msg.group_id}")
+
+
+def _mark_user_online(user_id: int):
+    count = online_users.get(user_id, 0) + 1
+    online_users[user_id] = count
+    if count == 1:
+        socketio.emit("user_status", {"user_id": user_id, "status": "online"})
+
+
+def _mark_user_offline(user_id: int):
+    count = online_users.get(user_id, 0) - 1
+    if count <= 0:
+        online_users.pop(user_id, None)
+        socketio.emit("user_status", {"user_id": user_id, "status": "offline"})
+    else:
+        online_users[user_id] = count
 
 
 # ----------------- Models -----------------
@@ -186,6 +240,67 @@ class PushSubscription(db.Model):
     updated_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None), onupdate=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
 
     __table_args__ = (db.UniqueConstraint('user_id', 'endpoint', name='uq_push_user_endpoint'),)
+
+
+# ----------------- Socket.IO Events -----------------
+@socketio.on("connect")
+def handle_socket_connect():
+    user_id = session.get("user_id")
+    if not user_id:
+        return
+    _mark_user_online(user_id)
+    join_room(f"user_{user_id}")
+    emit("presence_state", {"online_user_ids": list(online_users.keys())})
+
+
+@socketio.on("disconnect")
+def handle_socket_disconnect():
+    user_id = session.get("user_id")
+    if not user_id:
+        return
+    _mark_user_offline(user_id)
+
+
+@socketio.on("join_groups")
+def handle_join_groups(data):
+    user_id = session.get("user_id")
+    if not user_id:
+        return
+    group_ids = data.get("groups") if isinstance(data, dict) else []
+    for gid in group_ids or []:
+        try:
+            gid_int = int(gid)
+        except (TypeError, ValueError):
+            continue
+        join_room(f"group_{gid_int}")
+
+
+@socketio.on("typing")
+def handle_typing(data):
+    user_id = session.get("user_id")
+    if not user_id or not isinstance(data, dict):
+        return
+    group_id = data.get("group_id")
+    receiver_id = data.get("receiver_id")
+    is_typing = bool(data.get("is_typing"))
+    payload = {
+        "sender_id": user_id,
+        "group_id": group_id,
+        "receiver_id": receiver_id,
+        "is_typing": is_typing,
+    }
+    if group_id:
+        try:
+            gid_int = int(group_id)
+        except (TypeError, ValueError):
+            return
+        socketio.emit("typing", payload, room=f"group_{gid_int}", include_self=False)
+    elif receiver_id:
+        try:
+            rid_int = int(receiver_id)
+        except (TypeError, ValueError):
+            return
+        socketio.emit("typing", payload, room=f"user_{rid_int}", include_self=False)
 
 
 # ----------------- Routes -----------------
@@ -1154,6 +1269,8 @@ def send_group_message():
         except Exception:
             pass
 
+        _emit_group_message(msg)
+
         return jsonify({
             "status": "ok",
             "message": {
@@ -1248,6 +1365,8 @@ def send_group_image():
         except Exception:
             pass
 
+        _emit_group_message(msg)
+
         return jsonify({
             "status": "ok",
             "message": {
@@ -1338,6 +1457,9 @@ def send_group_audio():
                 send_push_to_user(mm.user_id, payload)
         except Exception:
             pass
+
+        _emit_group_message(msg)
+
         return jsonify({
             "status": "ok",
             "message": {
@@ -1428,6 +1550,8 @@ def send_group_file():
                 send_push_to_user(mm.user_id, payload)
         except Exception:
             pass
+
+        _emit_group_message(msg)
 
         return jsonify({
             "status": "ok",
@@ -1592,6 +1716,8 @@ def send_message():
         except Exception:
             pass
 
+        _emit_direct_message(msg)
+
         return jsonify({
             "status": "ok",
             "message": {
@@ -1683,6 +1809,8 @@ def send_image():
             send_push_to_user(receiver_id, payload)
         except Exception:
             pass
+
+        _emit_direct_message(msg)
 
         return jsonify({
             "status": "ok",
@@ -1777,6 +1905,8 @@ def send_audio():
         except Exception:
             pass
 
+        _emit_direct_message(msg)
+
         return jsonify({
             "status": "ok",
             "message": {
@@ -1869,6 +1999,8 @@ def send_file():
             send_push_to_user(receiver_id, payload)
         except Exception:
             pass
+
+        _emit_direct_message(msg)
 
         return jsonify({
             "status": "ok",
@@ -2511,10 +2643,11 @@ if __name__ == '__main__':
         print(f"   https://localhost:5000/install-certificate")
         print("=" * 50)
         
-    app.run(
+    socketio.run(
+        app,
         host="0.0.0.0",
         port=5443,
         debug=False,
         use_reloader=False,
-        ssl_context=("192.168.1.19.pem", "192.168.1.19-key.pem")
+        ssl_context=("192.168.1.19.pem", "192.168.1.19-key.pem"),
     )

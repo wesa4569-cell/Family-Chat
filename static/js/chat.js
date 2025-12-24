@@ -65,7 +65,6 @@
   let currentGroupId = null;
   let lastMessageTimestamp = 0;
   let lastMessageId = 0;
-  let pollingInterval = null;
   let notificationSound = null;
   let currentUserId = null;
   let displayedMessages = new Set();
@@ -73,6 +72,13 @@
   let suppressSound = true;
   let initialPaintDone = false;
   let currentGroupIsOwner = false;
+  let socket = null;
+  let socketConnected = false;
+  let onlineUsers = new Set();
+  let typingTimer = null;
+  let typingActive = false;
+  let typingIndicator = null;
+  let typingHideTimer = null;
 
   // ====== DOM Elements ======
   const messagesDiv = document.getElementById("messages");
@@ -81,6 +87,8 @@
   const receiverInput = document.getElementById("receiver-id");
   const groupInput = document.getElementById("group-id");
   const chatTitle = document.getElementById("chat-title");
+  const chatTitleWrap = document.querySelector(".chat-title-wrap");
+  const netStatus = document.getElementById("netStatus");
   const logoutBtn = document.getElementById("logout-btn");
   const groupActionsWrap = document.getElementById("groupActionsWrap");
   const groupActionsBtn = document.getElementById("groupActionsBtn");
@@ -807,18 +815,7 @@
     } catch (_) {}
   }
 
-  function startPolling() {
-    if (pollingInterval) clearInterval(pollingInterval);
-    pollingInterval = setInterval(() => loadMessages({ allowSound: true, forceScrollBottom: false }), 2500);
-  }
-
-  function stopPolling() {
-    if (pollingInterval) { clearInterval(pollingInterval); pollingInterval = null; }
-  }
-
   // ====== Sidebar Badges Refresh ======
-  let sidebarInterval = null;
-
   async function refreshSidebarBadges() {
     try {
       const res = await fetch("/api/unread_counts", { cache: "no-store" });
@@ -925,14 +922,164 @@
     items.forEach((el) => ul.appendChild(el));
   }
 
-  function startSidebarPolling() {
-    if (sidebarInterval) clearInterval(sidebarInterval);
-    refreshSidebarBadges();
-    sidebarInterval = setInterval(refreshSidebarBadges, 3000);
+  // ====== Realtime (Socket.IO) ======
+  function ensureTypingIndicator() {
+    if (typingIndicator || !chatTitleWrap) return;
+    typingIndicator = document.createElement("span");
+    typingIndicator.className = "typing-indicator";
+    typingIndicator.id = "typing-indicator";
+    chatTitleWrap.appendChild(typingIndicator);
   }
 
-  function stopSidebarPolling() {
-    if (sidebarInterval) { clearInterval(sidebarInterval); sidebarInterval = null; }
+  function setTypingIndicator(text) {
+    ensureTypingIndicator();
+    if (!typingIndicator) return;
+    if (text) {
+      typingIndicator.textContent = text;
+      typingIndicator.classList.add("active");
+    } else {
+      typingIndicator.textContent = "";
+      typingIndicator.classList.remove("active");
+    }
+  }
+
+  function setUserOnlineState(userId, isOnline) {
+    const li = document.querySelector(`li.user-item[data-user-id="${userId}"]`);
+    if (li) li.setAttribute("data-online", isOnline ? "1" : "0");
+  }
+
+  function renderNetStatus() {
+    if (!netStatus) return;
+    if (!socketConnected) {
+      netStatus.textContent = "غير متصل";
+      return;
+    }
+    if (currentReceiverId) {
+      netStatus.textContent = onlineUsers.has(String(currentReceiverId)) ? "متصل الآن" : "غير متصل";
+      return;
+    }
+    if (currentGroupId) {
+      netStatus.textContent = "متصل";
+      return;
+    }
+    netStatus.textContent = "";
+  }
+
+  function handleTypingEvent(data) {
+    if (!data || String(data.sender_id) === String(currentUserId)) return;
+    if (data.group_id) {
+      if (String(data.group_id) !== String(currentGroupId)) return;
+    } else if (String(data.sender_id) !== String(currentReceiverId)) {
+      return;
+    }
+    const senderName = document.querySelector(`li[data-user-id="${data.sender_id}"]`)?.getAttribute("data-name") || "مستخدم";
+    if (data.is_typing) {
+      const msg = data.group_id ? `${senderName} يكتب الآن...` : "يكتب الآن...";
+      setTypingIndicator(msg);
+      if (typingHideTimer) clearTimeout(typingHideTimer);
+      typingHideTimer = setTimeout(() => setTypingIndicator(""), 2500);
+    } else {
+      setTypingIndicator("");
+    }
+  }
+
+  function handleIncomingMessage(payload) {
+    const msg = payload?.message || payload;
+    if (!msg || !msg.id) return;
+    if (String(msg.sender_id) === String(currentUserId)) return;
+
+    const isGroup = payload?.type === "group" || msg.group_id;
+    const activeMatch = isGroup
+      ? (currentGroupId && String(msg.group_id) === String(currentGroupId))
+      : (currentReceiverId && String(msg.sender_id) === String(currentReceiverId));
+
+    const key = String(msg.id);
+    if (activeMatch) {
+      setTypingIndicator("");
+      if (displayedMessages.has(key)) return;
+      hideEmptyState();
+      appendMessage(msg);
+      displayedMessages.add(key);
+      if (msg.timestamp_ms && Number(msg.timestamp_ms) > lastMessageTimestamp) {
+        lastMessageTimestamp = Number(msg.timestamp_ms);
+      }
+      if (msg.id && Number(msg.id) > lastMessageId) {
+        lastMessageId = Number(msg.id);
+      }
+      scrollToBottom(false);
+      if (!suppressSound && initialPaintDone) {
+        audioManager.play("message");
+      }
+      if (document.hidden) {
+        const senderName = msg.sender_name || document.querySelector(`li[data-user-id="${msg.sender_id}"]`)?.getAttribute("data-name") || "مستخدم";
+        showNotification(senderName, msg.content, msg.id);
+      }
+    } else {
+      if (isGroup && msg.group_id) bumpConversation("group", msg.group_id, msg.timestamp_ms);
+      if (!isGroup) bumpConversation("user", msg.sender_id, msg.timestamp_ms);
+      refreshSidebarBadges();
+      if (document.hidden) {
+        const senderName = msg.sender_name || document.querySelector(`li[data-user-id="${msg.sender_id}"]`)?.getAttribute("data-name") || "مستخدم";
+        showNotification(senderName, msg.content, msg.id);
+      }
+    }
+  }
+
+  function emitTyping(isTyping) {
+    if (!socket || !socketConnected) return;
+    if (!currentReceiverId && !currentGroupId) return;
+    socket.emit("typing", {
+      receiver_id: currentReceiverId,
+      group_id: currentGroupId,
+      is_typing: isTyping,
+    });
+  }
+
+  function joinGroupRooms(groupIds) {
+    if (!socket || !socketConnected) return;
+    if (!Array.isArray(groupIds) || groupIds.length === 0) return;
+    socket.emit("join_groups", { groups: groupIds });
+  }
+
+  function initSocket() {
+    if (!window.io) return;
+    socket = window.io({ transports: ["websocket", "polling"] });
+    socket.on("connect", () => {
+      socketConnected = true;
+      const groupIds = Array.from(document.querySelectorAll('li.user-item[data-group-id]'))
+        .map((li) => li.getAttribute("data-group-id"))
+        .filter(Boolean);
+      joinGroupRooms(groupIds);
+      refreshSidebarBadges();
+      renderNetStatus();
+    });
+    socket.on("disconnect", () => {
+      socketConnected = false;
+      renderNetStatus();
+    });
+    socket.on("presence_state", (data) => {
+      const ids = Array.isArray(data?.online_user_ids) ? data.online_user_ids : [];
+      onlineUsers = new Set(ids.map((id) => String(id)));
+      document.querySelectorAll('li.user-item[data-user-id]').forEach((li) => {
+        const id = li.getAttribute("data-user-id");
+        if (!id) return;
+        setUserOnlineState(id, onlineUsers.has(String(id)));
+      });
+      renderNetStatus();
+    });
+    socket.on("user_status", (data) => {
+      if (!data) return;
+      const id = data.user_id;
+      if (!id) return;
+      const isOnline = data.status === "online";
+      if (isOnline) onlineUsers.add(String(id));
+      else onlineUsers.delete(String(id));
+      setUserOnlineState(id, isOnline);
+      renderNetStatus();
+    });
+    socket.on("typing", handleTypingEvent);
+    socket.on("new_message", handleIncomingMessage);
+    socket.on("refresh_unread", () => refreshSidebarBadges());
   }
 
   // ====== Group Actions Visibility ======
@@ -968,7 +1115,7 @@
 
   function changeChat(userId, userName) {
     if (!userId || String(currentReceiverId) === String(userId)) return;
-    stopPolling();
+    setTypingIndicator("");
     document.querySelectorAll(".user-item").forEach(li => li.classList.remove("active"));
     document.querySelector(`li[data-user-id="${userId}"]`)?.classList.add("active");
     currentGroupId = null;
@@ -989,15 +1136,14 @@
       hardScrollToBottom();
       setTimeout(() => { suppressSound = false; }, 250);
     });
-    startPolling();
-    startSidebarPolling();
+    renderNetStatus();
     closeDrawer();
     messageInput.focus();
   }
 
   function changeGroup(groupId, groupName) {
     if (!groupId || String(currentGroupId) === String(groupId)) return;
-    stopPolling();
+    setTypingIndicator("");
     document.querySelectorAll(".user-item").forEach(li => li.classList.remove("active"));
     document.querySelector(`li[data-group-id="${groupId}"]`)?.classList.add("active");
     currentGroupId = String(groupId);
@@ -1020,7 +1166,8 @@
       hardScrollToBottom();
       setTimeout(() => { suppressSound = false; }, 250);
     });
-    startPolling();
+    joinGroupRooms([currentGroupId]);
+    renderNetStatus();
     closeDrawer();
   }
 
@@ -1046,6 +1193,10 @@
     displayedMessages.add(String(tempId));
     messageInput.value = "";
     hardScrollToBottom();
+    if (typingActive) {
+      typingActive = false;
+      emitTyping(false);
+    }
 
     // Move conversation to top immediately (optimistic)
     if (currentGroupId) bumpConversation("group", currentGroupId, tempMsg.timestamp_ms);
@@ -1113,6 +1264,24 @@
   });
 
   form.addEventListener("submit", sendMessage);
+  messageInput?.addEventListener("input", () => {
+    if (!currentReceiverId && !currentGroupId) return;
+    if (!typingActive) {
+      typingActive = true;
+      emitTyping(true);
+    }
+    if (typingTimer) clearTimeout(typingTimer);
+    typingTimer = setTimeout(() => {
+      typingActive = false;
+      emitTyping(false);
+    }, 1500);
+  });
+  messageInput?.addEventListener("blur", () => {
+    if (typingActive) {
+      typingActive = false;
+      emitTyping(false);
+    }
+  });
 
   // ====== Attachments ======
   function ensureTarget() {
@@ -1314,18 +1483,18 @@
 
   // ====== Visibility Change ======
   document.addEventListener("visibilitychange", () => {
-    if (document.hidden) stopPolling();
-    else if (currentReceiverId || currentGroupId) {
+    if (!document.hidden && (currentReceiverId || currentGroupId)) {
       suppressSound = true;
       initialPaintDone = false;
       loadMessages({ allowSound: false, forceScrollBottom: false }).then(() => {
         setTimeout(() => { suppressSound = false; }, 250);
       });
-      startPolling();
     }
   });
 
-  window.addEventListener("beforeunload", stopPolling);
+  window.addEventListener("beforeunload", () => {
+    if (typingActive) emitTyping(false);
+  });
 
   // ====== 🎯 Group Modals - Enhanced & Professional ======
   
@@ -1690,9 +1859,10 @@
   document.addEventListener("DOMContentLoaded", () => {
     const bodyId = document.body.getAttribute("data-user-id");
     if (bodyId) currentUserId = parseInt(bodyId, 10);
-    
+
     requestNotificationPermission();
     initNotificationSettingsUI();
+    initSocket();
     // Auto-enable Push subscription if user enabled it previously
     if (readPushEnabled()) {
       ensurePushSubscription().then((ok) => {
@@ -1720,20 +1890,14 @@
         hardScrollToBottom();
         setTimeout(() => { suppressSound = false; }, 250);
       });
-      
-      startPolling();
+
+      renderNetStatus();
       closeDrawer();
     } else {
       if (window.innerWidth <= 992) openDrawer();
     }
-    
-    startSidebarPolling();
+    refreshSidebarBadges();
+    renderNetStatus();
   });
 
 })();
-
-function startSidebarPolling() {
-  if (sidebarInterval) clearInterval(sidebarInterval);
-  refreshSidebarBadges();
-  sidebarInterval = setInterval(refreshSidebarBadges, 3000);
-}
