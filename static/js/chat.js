@@ -122,6 +122,52 @@
   const emojiPicker = document.getElementById("emoji-picker");
   const bodyEl = document.body;
 
+  // Reply / Edit bars (WhatsApp-like)
+  const replyBar = document.getElementById("replyBar");
+  const replyTitle = document.getElementById("replyTitle");
+  const replySnippet = document.getElementById("replySnippet");
+  const replyClose = document.getElementById("replyClose");
+  const editBar = document.getElementById("editBar");
+  const editSnippet = document.getElementById("editSnippet");
+  const editCancel = document.getElementById("editCancel");
+  const replyToInput = document.getElementById("reply-to-id");
+  const editMessageIdInput = document.getElementById("edit-message-id");
+
+  // Header actions & modals
+  const btnStarred = document.getElementById("btnStarred");
+  const btnGroupInfo = document.getElementById("btnGroupInfo");
+  const starredModal = document.getElementById("starredModal");
+  const starredList = document.getElementById("starredList");
+  const starredClose = document.getElementById("starredClose");
+  const groupInfoModal = document.getElementById("groupInfoModal");
+  const groupMembersList = document.getElementById("groupMembersList");
+  const groupInfoClose = document.getElementById("groupInfoClose");
+  const btnCreateInviteLink = document.getElementById("btnCreateInviteLink");
+  const btnCopyInviteLink = document.getElementById("btnCopyInviteLink");
+  const inviteLinkInput = document.getElementById("inviteLinkInput");
+
+  // Message context menu
+  const msgMenu = document.getElementById("msgMenu");
+  const msgActReply = document.getElementById("msgActReply");
+  const msgActForward = document.getElementById("msgActForward");
+  const msgActCopy = document.getElementById("msgActCopy");
+  const msgActStar = document.getElementById("msgActStar");
+  const msgActEdit = document.getElementById("msgActEdit");
+  const msgActDeleteMe = document.getElementById("msgActDeleteMe");
+  const msgActDeleteAll = document.getElementById("msgActDeleteAll");
+
+  const forwardModal = document.getElementById("forwardModal");
+  const forwardTargets = document.getElementById("forwardTargets");
+  const forwardCancel = document.getElementById("forwardCancel");
+  const forwardConfirm = document.getElementById("forwardConfirm");
+
+  // Cache messages by id for quick actions (reply/edit/copy)
+  const messageCache = new Map();
+  const groupMessageCache = new Map();
+  let selectedMessage = null; // {type:'dm'|'group', id, sender_id, content, message_type}
+  let forwardSourceMessage = null; // message being forwarded
+  let forwardSelections = new Map(); // key -> {type:'dm'|'group', id}
+
   if (!messagesDiv || !form || !messageInput || !receiverInput) return;
 
   // Cache last seen values for quick subtitle rendering
@@ -458,7 +504,11 @@
   // ====== 🎯 Settings Dropdown Toggle ======
   // NOTE: Bootstrap JS is not used, so we manually toggle and position the menu.
   if (groupActionsBtn) {
+    // If Bootstrap bundle is present, it can conflict with our manual dropdown.
+    // Remove the bootstrap toggle attribute and handle everything here.
+    try { groupActionsBtn.removeAttribute("data-bs-toggle"); } catch (_) {}
     groupActionsBtn.addEventListener("click", (e) => {
+      e.preventDefault();
       e.stopPropagation();
       const menu = groupActionsWrap?.querySelector(".dropdown-menu");
       const willOpen = !menu?.classList.contains("show");
@@ -468,6 +518,7 @@
           menu.classList.add("show");
           menu.style.position = "fixed";
           menu.style.inset = "auto";
+          menu.style.zIndex = "2600";
           const r = groupActionsBtn.getBoundingClientRect();
           const menuW = Math.min(menu.offsetWidth || 220, window.innerWidth - 16);
 
@@ -491,6 +542,7 @@
         if (menu) {
           menu.classList.remove("show");
           menu.style.position = "";
+          menu.style.zIndex = "";
           menu.style.top = "";
           menu.style.right = "";
           menu.style.left = "";
@@ -508,6 +560,7 @@
         if (menu) {
           menu.classList.remove("show");
           menu.style.position = "";
+          menu.style.zIndex = "";
           menu.style.top = "";
           menu.style.right = "";
           menu.style.left = "";
@@ -630,8 +683,17 @@
     const isSent = String(msg.sender_id) === String(currentUserId);
     div.className = isSent ? "message sender" : "message receiver";
     div.dataset.msgId = String(msg.id);
+    // Type is needed for context menu actions
+    const isGroup = Boolean(currentGroupId || msg.group_id);
+    div.dataset.msgType = isGroup ? "group" : "dm";
     div.innerHTML = buildMessageInner(msg, isSent);
     fragment.appendChild(div);
+
+    // Cache for quick operations (reply/edit/copy)
+    try {
+      if (isGroup) groupMessageCache.set(String(msg.id), msg);
+      else messageCache.set(String(msg.id), msg);
+    } catch (_) {}
   }
 
   function appendMessageNow(msg) {
@@ -663,28 +725,26 @@
     const isGroup = Boolean(currentGroupId || msg.group_id);
     const senderName = (msg.sender_name || msg.sender || "").trim();
     const senderLine = (isGroup && !isSent && senderName) ? `<div class="msg-sender">${escapeHtml(senderName)}</div>` : "";
-    const statusHtml = buildStatusHtml(msg, isSent, isGroup);
-    const timeLine = `<div class="message-time">${t}${statusHtml}</div>`;
 
     if (type === "image" && mediaUrl) {
       const safeUrl = escapeHtml(mediaUrl);
-      return `${senderLine}<div class="media-wrap"><a href="${safeUrl}" target="_blank" rel="noopener"><img class="msg-image" src="${safeUrl}" alt="image" loading="lazy"></a></div>${timeLine}`;
+      return `${senderLine}<div class="media-wrap"><a href="${safeUrl}" target="_blank" rel="noopener"><img class="msg-image" src="${safeUrl}" alt="image" loading="lazy"></a></div><div class="message-time">${t}</div>`;
     }
     if (type === "audio" && mediaUrl) {
       const safeUrl = escapeHtml(mediaUrl);
-      return `${senderLine}<div class="media-wrap"><audio controls preload="none" src="${safeUrl}"></audio></div>${timeLine}`;
+      return `${senderLine}<div class="media-wrap"><audio controls preload="none" src="${safeUrl}"></audio></div><div class="message-time">${t}</div>`;
     }
     if ((type === "video" || (type === "file" && (msg.media_mime || "").toLowerCase().startsWith("video/"))) && mediaUrl) {
       const safeUrl = escapeHtml(mediaUrl);
-      return `${senderLine}<div class="media-wrap"><video controls preload="metadata" src="${safeUrl}" style="max-width:100%;border-radius:12px;"></video></div>${timeLine}`;
+      return `${senderLine}<div class="media-wrap"><video controls preload="metadata" src="${safeUrl}" style="max-width:100%;border-radius:12px;"></video></div><div class="message-time">${t}</div>`;
     }
     if (type === "file" && mediaUrl) {
       const safeUrl = escapeHtml(mediaUrl);
       const fname = escapeHtml(msg.content || "ملف");
       const mime2 = escapeHtml(msg.media_mime || "");
-      return `${senderLine}<div class="file-wrap"><a class="file-link" href="${safeUrl}" target="_blank" rel="noopener"><i class="bi bi-paperclip"></i><span class="file-name">${fname}</span></a>${mime2 ? `<div class="file-mime">${mime2}</div>` : ``}</div>${timeLine}`;
+      return `${senderLine}<div class="file-wrap"><a class="file-link" href="${safeUrl}" target="_blank" rel="noopener"><i class="bi bi-paperclip"></i><span class="file-name">${fname}</span></a>${mime2 ? `<div class="file-mime">${mime2}</div>` : ``}</div><div class="message-time">${t}</div>`;
     }
-    return `${senderLine}<div>${escapeHtml(msg.content || "")}</div>${timeLine}`;
+    return `${senderLine}<div>${escapeHtml(msg.content || "")}</div><div class="message-time">${t}</div>`;
   }
 
   function pruneOldMessages() {
@@ -694,6 +754,510 @@
     for (let i = 0; i < excess; i += 1) {
       messages[i].remove();
     }
+  }
+
+  // ====== Message actions (reply / edit / delete / star / forward) ======
+  function hideMsgMenu() {
+    if (!msgMenu) return;
+    msgMenu.classList.add("hidden");
+    selectedMessage = null;
+  }
+
+  function positionMsgMenu(x, y) {
+    if (!msgMenu) return;
+    const pad = 10;
+    const rect = msgMenu.getBoundingClientRect();
+    let left = x;
+    let top = y;
+    // Keep inside viewport
+    if (left + rect.width + pad > window.innerWidth) left = window.innerWidth - rect.width - pad;
+    if (top + rect.height + pad > window.innerHeight) top = window.innerHeight - rect.height - pad;
+    if (left < pad) left = pad;
+    if (top < pad) top = pad;
+    msgMenu.style.left = `${left}px`;
+    msgMenu.style.top = `${top}px`;
+  }
+
+  function getMsgFromCache(type, id) {
+    try {
+      if (type === "group") return groupMessageCache.get(String(id)) || null;
+      return messageCache.get(String(id)) || null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function openMsgMenuForElement(msgEl, clientX, clientY) {
+    if (!msgEl || !msgMenu) return;
+    const id = msgEl.dataset.msgId;
+    const type = msgEl.dataset.msgType || (currentGroupId ? "group" : "dm");
+    const msg = getMsgFromCache(type, id) || { id };
+    const isSent = msgEl.classList.contains("sender") || String(msg.sender_id) === String(currentUserId);
+
+    selectedMessage = {
+      type,
+      id: String(id),
+      isSent,
+      message_type: (msg.message_type || msg.type || "text"),
+      content: (msg.content || ""),
+      sender_id: msg.sender_id,
+    };
+
+    // Toggle available actions
+    if (msgActDeleteAll) msgActDeleteAll.style.display = (type === "dm" && isSent) ? "flex" : "none";
+    if (msgActEdit) msgActEdit.style.display = (isSent && (selectedMessage.message_type === "text" || selectedMessage.message_type === "system")) ? "flex" : "none";
+    if (msgActStar) msgActStar.style.display = (type === "dm") ? "flex" : "none";
+
+    msgMenu.classList.remove("hidden");
+    // Ensure dimensions exist before positioning
+    requestAnimationFrame(() => {
+      positionMsgMenu(clientX, clientY);
+    });
+  }
+
+  function setReplyTo(msg) {
+    if (!replyBar || !replyToInput || !msg) return;
+    replyToInput.value = String(msg.id);
+    if (replySnippet) replySnippet.textContent = (msg.content || "").toString().slice(0, 120);
+    if (replyTitle) replyTitle.textContent = "رد";
+    replyBar.classList.remove("hidden");
+    // Cancel edit if active
+    if (editBar && !editBar.classList.contains("hidden")) {
+      editBar.classList.add("hidden");
+      editMessageIdInput.value = "";
+    }
+    messageInput.focus();
+  }
+
+  function clearReply() {
+    if (replyBar) replyBar.classList.add("hidden");
+    if (replyToInput) replyToInput.value = "";
+  }
+
+  function setEdit(msg) {
+    if (!editBar || !editMessageIdInput || !msg) return;
+    editMessageIdInput.value = String(msg.id);
+    if (editSnippet) editSnippet.textContent = (msg.content || "").toString().slice(0, 120);
+    editBar.classList.remove("hidden");
+    // Cancel reply if active
+    clearReply();
+    messageInput.value = (msg.content || "").toString();
+    messageInput.focus();
+  }
+
+  function clearEdit() {
+    if (editBar) editBar.classList.add("hidden");
+    if (editMessageIdInput) editMessageIdInput.value = "";
+    if (editSnippet) editSnippet.textContent = "";
+  }
+
+  async function apiDeleteForMe(sel) {
+    if (!sel) return;
+    const url = sel.type === "group" ? `/api/group_messages/${sel.id}/delete_for_me` : `/api/messages/${sel.id}/delete_for_me`;
+    const r = await fetch(url, { method: "POST", credentials: "same-origin" });
+    if (r.ok) {
+      // Remove from DOM immediately
+      const el = messagesDiv.querySelector(`.message[data-msg-id="${CSS.escape(String(sel.id))}"]`);
+      if (el) el.remove();
+      showToast("تم الحذف عندك", "success");
+    } else {
+      showToast("تعذر الحذف", "error");
+    }
+  }
+
+  async function apiDeleteForAll(sel) {
+    if (!sel) return;
+    if (sel.type !== "dm") return;
+    const r = await fetch(`/api/messages/${sel.id}/delete_for_all`, { method: "POST", credentials: "same-origin" });
+    if (r.ok) {
+      showToast("تم الحذف للجميع", "success");
+    } else {
+      showToast("تعذر الحذف للجميع", "error");
+    }
+  }
+
+  async function apiStar(sel) {
+    if (!sel || sel.type !== "dm") return;
+    // Toggle using local marker (frontend only). Backend stores per-user.
+    const enabled = !Boolean(sel._starred);
+    const r = await fetch(`/api/messages/${sel.id}/star`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "same-origin",
+      body: JSON.stringify({ enable: enabled })
+    });
+    if (r.ok) {
+      sel._starred = enabled;
+      showToast(enabled ? "تم تمييز الرسالة" : "تم إلغاء التمييز", "success");
+    } else {
+      showToast("تعذر تمييز الرسالة", "error");
+    }
+  }
+
+  function openForwardModal(sel) {
+    if (!forwardModal || !forwardTargets || !sel) return;
+    forwardTargets.innerHTML = "";
+    forwardSourceMessage = sel;
+    forwardSelections = new Map();
+
+    const items = Array.from(document.querySelectorAll("#users-list li.user-item[data-user-id], #users-list li.user-item[data-group-id]"));
+    if (!items.length) {
+      forwardTargets.innerHTML = `<div class="members-loading">لا توجد محادثات</div>`;
+    }
+    items.forEach((li) => {
+      const isGroup = li.hasAttribute("data-group-id");
+      const id = isGroup ? li.getAttribute("data-group-id") : li.getAttribute("data-user-id");
+      const name = (li.getAttribute("data-name") || "").toString();
+      const row = document.createElement("div");
+      row.className = "member-row";
+      row.style.cursor = "pointer";
+      row.setAttribute("role", "button");
+      row.setAttribute("tabindex", "0");
+      row.dataset.ftType = isGroup ? "group" : "dm";
+      row.dataset.ftId = String(id || "");
+      row.innerHTML = `<div style="font-weight:800;">${escapeHtml(name || (isGroup ? "مجموعة" : "مستخدم"))}</div><div style="margin-inline-start:auto;opacity:.75;font-size:12px;">${isGroup ? "مجموعة" : "محادثة"}</div>`;
+
+      const togglePick = () => {
+        const t = row.dataset.ftType;
+        const i = row.dataset.ftId;
+        if (!t || !i) return;
+        const target = { type: t === "group" ? "group" : "dm", id: String(i) };
+        const key = `${target.type}:${target.id}`;
+        if (forwardSelections.has(key)) {
+          forwardSelections.delete(key);
+          row.classList.remove("selected");
+        } else {
+          forwardSelections.set(key, target);
+          row.classList.add("selected");
+        }
+        if (forwardConfirm) forwardConfirm.disabled = (forwardSelections.size === 0);
+      };
+
+      // Some browsers/devices may not fire click reliably inside scrollable containers,
+      // so we listen to both click and pointer/touch events.
+      row.addEventListener("click", togglePick);
+      row.addEventListener("pointerdown", togglePick, { passive: true });
+      row.addEventListener("touchstart", togglePick, { passive: true });
+      row.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" || e.key === " ") { e.preventDefault(); togglePick(); }
+      });
+      forwardTargets.appendChild(row);
+    });
+
+    forwardModal.classList.remove("hidden");
+    if (forwardConfirm) forwardConfirm.disabled = true;
+  }
+
+  async function apiForward(sel, target, opts = {}) {
+    if (!sel || !target) return;
+    if ((sel.message_type || "text") !== "text") {
+      if (!opts.silent) showToast("إعادة توجيه الوسائط غير مدعوم حالياً", "warning");
+      return;
+    }
+    // Use lightweight endpoint if available, else fallback to sending new text message.
+    try {
+      const url = sel.type === "group" ? `/api/group_messages/${sel.id}/forward` : `/api/messages/${sel.id}/forward`;
+      const r = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "same-origin",
+        body: JSON.stringify({ target_type: target.type, target_id: target.id })
+      });
+      if (r.ok) {
+        if (!opts.silent) showToast("تمت إعادة التوجيه", "success");
+        return;
+      }
+    } catch (_) {}
+
+    // Fallback
+    const fd = new FormData();
+    fd.append("content", sel.content || "");
+    if (target.type === "group") {
+      fd.append("group_id", target.id);
+      await fetch("/send_group_message", { method: "POST", body: fd, credentials: "same-origin" });
+    } else {
+      fd.append("receiver_id", target.id);
+      await fetch("/send_message", { method: "POST", body: fd, credentials: "same-origin" });
+    }
+    if (!opts.silent) showToast("تمت إعادة التوجيه", "success");
+  }
+
+  function initMessageActionsUI() {
+    if (!messagesDiv) return;
+
+    // Close menu on outside click / scroll
+    document.addEventListener("click", (e) => {
+      if (!msgMenu) return;
+      if (msgMenu.classList.contains("hidden")) return;
+      const t = e.target;
+      if (t && msgMenu.contains(t)) return;
+      hideMsgMenu();
+    });
+    messagesDiv.addEventListener("scroll", () => hideMsgMenu(), { passive: true });
+    window.addEventListener("resize", () => hideMsgMenu());
+
+    // Right click
+    messagesDiv.addEventListener("contextmenu", (e) => {
+      const el = e.target?.closest?.(".message");
+      if (!el) return;
+      e.preventDefault();
+      openMsgMenuForElement(el, e.clientX, e.clientY);
+    });
+
+    // Long-press for touch
+    let lpTimer = null;
+    messagesDiv.addEventListener("touchstart", (e) => {
+      const el = e.target?.closest?.(".message");
+      if (!el) return;
+      const t = e.touches && e.touches[0];
+      if (!t) return;
+      lpTimer = setTimeout(() => {
+        openMsgMenuForElement(el, t.clientX, t.clientY);
+      }, 550);
+    }, { passive: true });
+    messagesDiv.addEventListener("touchend", () => { if (lpTimer) clearTimeout(lpTimer); lpTimer = null; }, { passive: true });
+    messagesDiv.addEventListener("touchmove", () => { if (lpTimer) clearTimeout(lpTimer); lpTimer = null; }, { passive: true });
+
+    // Quote click: scroll to replied message if exists in DOM
+    messagesDiv.addEventListener("click", (e) => {
+      const q = e.target?.closest?.(".msg-reply-quote");
+      if (!q) return;
+      const id = q.getAttribute("data-reply-to");
+      if (!id) return;
+      const mEl = messagesDiv.querySelector(`.message[data-msg-id="${CSS.escape(String(id))}"]`);
+      if (mEl) mEl.scrollIntoView({ behavior: "smooth", block: "center" });
+    });
+
+    // Action buttons
+    msgActReply?.addEventListener("click", () => {
+      const sel = selectedMessage;
+      hideMsgMenu();
+      const msg = getMsgFromCache(sel?.type, sel?.id);
+      if (msg) setReplyTo(msg);
+    });
+    msgActEdit?.addEventListener("click", () => {
+      const sel = selectedMessage;
+      hideMsgMenu();
+      const msg = getMsgFromCache(sel?.type, sel?.id);
+      if (msg) setEdit(msg);
+    });
+    msgActCopy?.addEventListener("click", async () => {
+      const sel = selectedMessage;
+      hideMsgMenu();
+      const txt = (sel?.content || "").toString();
+      try {
+        await navigator.clipboard.writeText(txt);
+        showToast("تم النسخ", "success");
+      } catch (_) {
+        showToast("تعذر النسخ", "error");
+      }
+    });
+    msgActStar?.addEventListener("click", async () => {
+      const sel = selectedMessage;
+      hideMsgMenu();
+      if (!sel) return;
+      await apiStar(sel);
+    });
+    msgActDeleteMe?.addEventListener("click", async () => {
+      const sel = selectedMessage;
+      hideMsgMenu();
+      await apiDeleteForMe(sel);
+    });
+    msgActDeleteAll?.addEventListener("click", async () => {
+      const sel = selectedMessage;
+      hideMsgMenu();
+      await apiDeleteForAll(sel);
+    });
+    msgActForward?.addEventListener("click", () => {
+      const sel = selectedMessage;
+      hideMsgMenu();
+      openForwardModal(sel);
+    });
+
+    // Reply/Edit close
+    replyClose?.addEventListener("click", () => clearReply());
+    editCancel?.addEventListener("click", () => clearEdit());
+
+    // Forward modal
+    forwardCancel?.addEventListener("click", () => {
+      if (forwardModal) forwardModal.classList.add("hidden");
+    });
+    forwardConfirm?.addEventListener("click", async () => {
+      const sel = forwardSourceMessage;
+      const targets = Array.from(forwardSelections.values());
+      if (!sel || !targets.length) return;
+      if (forwardModal) forwardModal.classList.add("hidden");
+      // Forward sequentially to keep the UI responsive and avoid flooding the server
+      for (const t of targets) {
+        try {
+          await apiForward(sel, t, { silent: true });
+        } catch (_) {}
+      }
+      showToast("تمت إعادة التوجيه", "success");
+    });
+  }
+
+  function initHeaderModalsUI() {
+    // Starred
+    btnStarred?.addEventListener("click", async () => {
+      if (!starredModal || !starredList) return;
+      starredList.innerHTML = `<div class="members-loading">جارٍ التحميل...</div>`;
+      starredModal.classList.remove("hidden");
+      try {
+        const r = await fetch("/api/starred", { credentials: "same-origin" });
+        if (!r.ok) throw new Error("bad");
+        const j = await r.json();
+        if (!j || !j.ok) throw new Error("bad");
+        const arr = Array.isArray(j.messages) ? j.messages : [];
+        if (!arr.length) {
+          starredList.innerHTML = `<div class="members-loading">لا توجد رسائل مميزة</div>`;
+          return;
+        }
+        const frag = document.createDocumentFragment();
+        arr.forEach((m) => {
+          const row = document.createElement("div");
+          row.className = "starred-row";
+          // Include an "unstar" button so user can remove the highlight.
+          const top = `
+            <div class="sr-top">
+              <div class="sr-name">${escapeHtml(m.chat_name || "")}</div>
+              <div style="margin-inline-start:auto;display:flex;align-items:center;gap:10px;">
+                <div class="sr-time">${escapeHtml(m.timestamp || "")}</div>
+                <button type="button" class="modal-btn secondary" data-unstar="1" data-msg-id="${escapeHtml(String(m.message_id))}" style="padding:6px 10px;border-radius:10px;">إلغاء</button>
+              </div>
+            </div>`;
+          const text = `<div class="sr-text">${escapeHtml(m.content || "")}</div>`;
+          row.innerHTML = top + text;
+          frag.appendChild(row);
+        });
+        starredList.innerHTML = "";
+        starredList.appendChild(frag);
+
+        // Delegate unstar actions
+        starredList.onclick = async (ev) => {
+          const btn = ev.target?.closest?.("button[data-unstar][data-msg-id]");
+          if (!btn) return;
+          const mid = btn.getAttribute("data-msg-id");
+          if (!mid) return;
+          btn.disabled = true;
+          try {
+            const r2 = await fetch(`/api/messages/${mid}/star`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              credentials: "same-origin",
+              body: JSON.stringify({ enable: false })
+            });
+            if (!r2.ok) throw new Error("bad");
+            // Remove the row from UI
+            const card = btn.closest?.(".starred-row");
+            card?.remove();
+            showToast("تم إلغاء التمييز", "success");
+            if (!starredList.querySelector(".starred-row")) {
+              starredList.innerHTML = `<div class="members-loading">لا توجد رسائل مميزة</div>`;
+            }
+          } catch (_) {
+            btn.disabled = false;
+            showToast("تعذر إلغاء التمييز", "error");
+          }
+        };
+      } catch (_) {
+        starredList.innerHTML = `<div class="members-loading error">تعذر تحميل الرسائل المميزة</div>`;
+      }
+    });
+    starredClose?.addEventListener("click", () => { starredModal?.classList.add("hidden"); });
+
+    // Group info
+    btnGroupInfo?.addEventListener("click", async () => {
+      if (!groupInfoModal || !groupMembersList || !currentGroupId) return;
+      groupMembersList.innerHTML = `<div class="members-loading">جارٍ التحميل...</div>`;
+      inviteLinkInput && (inviteLinkInput.value = "");
+      if (btnCopyInviteLink) { btnCopyInviteLink.disabled = true; }
+      groupInfoModal.classList.remove("hidden");
+      try {
+        const r = await fetch(`/api/groups/${currentGroupId}/members`, { credentials: "same-origin" });
+        if (!r.ok) throw new Error("bad");
+        const j = await r.json();
+        if (!j || !j.ok) throw new Error("bad");
+        const arr = Array.isArray(j.members) ? j.members : [];
+        if (!arr.length) {
+          groupMembersList.innerHTML = `<div class="members-loading">لا يوجد أعضاء</div>`;
+          return;
+        }
+        const meRole = (j.my_role || "member").toString();
+        const frag = document.createDocumentFragment();
+        arr.forEach((u) => {
+          const row = document.createElement("div");
+          row.className = "member-row";
+          const roleLabel = u.role === "owner" ? "المالك" : (u.role === "admin" ? "مشرف" : "عضو");
+          const canManage = (meRole === "owner") && String(u.user_id) !== String(currentUserId);
+          row.innerHTML = `
+            <div style="display:flex;align-items:center;gap:10px;width:100%;">
+              <div style="font-weight:900;">${escapeHtml(u.name || "")}</div>
+              <div style="opacity:.75;font-size:12px;">${escapeHtml(u.phone_number || "")}</div>
+              <div style="margin-inline-start:auto;display:flex;gap:8px;align-items:center;">
+                <span style="font-size:12px;opacity:.85;font-weight:900;">${roleLabel}</span>
+                ${canManage && u.role !== "admin" ? `<button class="modal-btn secondary" data-act="promote" data-uid="${escapeHtml(String(u.user_id))}" style="padding:6px 8px;border-radius:10px;">ترقية</button>` : ""}
+                ${canManage && u.role === "admin" ? `<button class="modal-btn secondary" data-act="demote" data-uid="${escapeHtml(String(u.user_id))}" style="padding:6px 8px;border-radius:10px;">إلغاء</button>` : ""}
+              </div>
+            </div>
+          `;
+          frag.appendChild(row);
+        });
+        groupMembersList.innerHTML = "";
+        groupMembersList.appendChild(frag);
+
+        // Wire promote/demote
+        groupMembersList.querySelectorAll("button[data-act]").forEach((btn) => {
+          btn.addEventListener("click", async (ev) => {
+            ev.preventDefault();
+            const act = btn.getAttribute("data-act");
+            const uid = btn.getAttribute("data-uid");
+            if (!uid || !act) return;
+            const url = act === "promote" ? `/api/groups/${currentGroupId}/members/${uid}/promote` : `/api/groups/${currentGroupId}/members/${uid}/demote`;
+            const rr = await fetch(url, { method: "POST", credentials: "same-origin" });
+            if (rr.ok) {
+              showToast("تم التحديث", "success");
+              // Refresh list
+              btnGroupInfo.click();
+            } else {
+              showToast("تعذر تحديث الصلاحيات", "error");
+            }
+          });
+        });
+      } catch (_) {
+        groupMembersList.innerHTML = `<div class="members-loading error">تعذر تحميل الأعضاء</div>`;
+      }
+    });
+    groupInfoClose?.addEventListener("click", () => { groupInfoModal?.classList.add("hidden"); });
+
+    btnCreateInviteLink?.addEventListener("click", async () => {
+      if (!currentGroupId) return;
+      try {
+        const r = await fetch(`/api/groups/${currentGroupId}/invite_link`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "same-origin",
+          body: JSON.stringify({})
+        });
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok || !j || !j.ok) throw new Error("bad");
+        if (inviteLinkInput) inviteLinkInput.value = j.url || "";
+        if (btnCopyInviteLink) btnCopyInviteLink.disabled = !(j.url);
+        showToast("تم إنشاء رابط الدعوة", "success");
+      } catch (_) {
+        showToast("تعذر إنشاء رابط الدعوة", "error");
+      }
+    });
+    btnCopyInviteLink?.addEventListener("click", async () => {
+      const v = inviteLinkInput?.value || "";
+      if (!v) return;
+      try {
+        await navigator.clipboard.writeText(v);
+        showToast("تم نسخ الرابط", "success");
+      } catch (_) {
+        showToast("تعذر نسخ الرابط", "error");
+      }
+    });
   }
 
   // ====== Notifications ======
@@ -1013,28 +1577,61 @@
     badgePollIntervalId = null;
   }
 
+  function updateConversationFlags(li){
+    if(!li) return;
+    const pin = li.querySelector('.flag-pin');
+    const mute = li.querySelector('.flag-mute');
+    const arch = li.querySelector('.flag-arch');
+
+    const pinnedRankRaw = (li.getAttribute('data-pinned-rank') || '').trim();
+    const isPinned = pinnedRankRaw !== '';
+    const isArchived = (li.getAttribute('data-archived') || '0') === '1';
+    const mutedUntil = (li.getAttribute('data-muted-until') || '').trim();
+    const isMuted = mutedUntil !== '' && (new Date(mutedUntil).getTime() > Date.now());
+
+    if(pin) pin.style.display = isPinned ? 'inline' : 'none';
+    if(mute) mute.style.display = isMuted ? 'inline' : 'none';
+    if(arch) arch.style.display = isArchived ? 'inline' : 'none';
+
+    li.classList.toggle('archived', isArchived);
+  }
+
   function reorderConversationList() {
     const ul = document.getElementById("users-list");
     if (!ul) return;
 
     // Keep special items on top
-    const pinned = [];
+    const special = [];
     const add = document.getElementById("btnAddGroup");
     const inv = document.getElementById("btnGroupInvites");
-    if (add) pinned.push(add);
-    if (inv) pinned.push(inv);
+    if (add) special.push(add);
+    if (inv) special.push(inv);
 
     const items = Array.from(ul.querySelectorAll('li.user-item[data-user-id], li.user-item[data-group-id]'));
+    items.forEach(updateConversationFlags);
+
     items.sort((a, b) => {
+      const aArchived = (a.getAttribute("data-archived") || "0") === "1";
+      const bArchived = (b.getAttribute("data-archived") || "0") === "1";
+      if (aArchived !== bArchived) return aArchived ? 1 : -1;
+
+      const aPinRaw = (a.getAttribute("data-pinned-rank") || "").trim();
+      const bPinRaw = (b.getAttribute("data-pinned-rank") || "").trim();
+      const aPin = aPinRaw === "" ? 1e9 : Number(aPinRaw);
+      const bPin = bPinRaw === "" ? 1e9 : Number(bPinRaw);
+      if (aPin !== bPin) return aPin - bPin;
+
       const am = Number(a.getAttribute("data-last-ms") || 0);
       const bm = Number(b.getAttribute("data-last-ms") || 0);
       if (bm !== am) return bm - am;
+
       const an = (a.getAttribute("data-name") || "").toLowerCase();
       const bn = (b.getAttribute("data-name") || "").toLowerCase();
       return an.localeCompare(bn, "ar");
     });
 
-    pinned.forEach((el) => { if (el.parentElement === ul) ul.appendChild(el); });
+    // Re-append
+    special.forEach((el) => { if (el && el.parentElement === ul) ul.appendChild(el); });
     items.forEach((el) => ul.appendChild(el));
   }
 
@@ -1070,15 +1667,61 @@
       netStatus.textContent = "غير متصل";
       return;
     }
-    if (currentReceiverId) {
-      netStatus.textContent = onlineUsers.has(String(currentReceiverId)) ? "متصل الآن" : "غير متصل";
-      return;
-    }
-    if (currentGroupId) {
-      netStatus.textContent = "متصل";
-      return;
-    }
+    // لا نعرض حالة تواجد المستخدم هنا لتجنب تكرارها؛
+    // التواجد يعرض أسفل الاسم عبر chatSubtitle.
     netStatus.textContent = "";
+  }
+
+  function formatLastSeen(iso) {
+    if (!iso) return "";
+    try {
+      const d = new Date(iso);
+      if (Number.isNaN(d.getTime())) return "";
+      const now = new Date();
+      const dateKey = d.toISOString().split("T")[0];
+      const todayKey = now.toISOString().split("T")[0];
+      const yKey = new Date(now.getTime() - 86400000).toISOString().split("T")[0];
+      const timeStr = d.toLocaleTimeString("ar-EG", { hour: "2-digit", minute: "2-digit" });
+      if (dateKey === todayKey) return `آخر ظهور اليوم ${timeStr}`;
+      if (dateKey === yKey) return `آخر ظهور أمس ${timeStr}`;
+      const dateStr = d.toLocaleDateString("ar-EG", { day: "numeric", month: "long" });
+      return `آخر ظهور ${dateStr} ${timeStr}`;
+    } catch (_) {
+      return "";
+    }
+  }
+
+  async function refreshActivePresence(forceFetch = false) {
+    if (!chatSubtitle) return;
+    if (!currentReceiverId) {
+      chatSubtitle.textContent = "";
+      return;
+    }
+    const uid = String(currentReceiverId);
+    const isOnline = onlineUsers.has(uid);
+    if (isOnline) {
+      chatSubtitle.textContent = "متصل الآن";
+      return;
+    }
+    const cached = lastSeenByUserId.get(uid);
+    if (cached && !forceFetch) {
+      chatSubtitle.textContent = formatLastSeen(cached) || "غير متصل";
+      return;
+    }
+    try {
+      const res = await fetch(`/api/users/${encodeURIComponent(uid)}/presence`, { credentials: "same-origin" });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data?.ok) {
+        if (data.last_seen) lastSeenByUserId.set(uid, data.last_seen);
+        if (data.online) {
+          chatSubtitle.textContent = "متصل الآن";
+        } else {
+          chatSubtitle.textContent = formatLastSeen(data.last_seen) || "غير متصل";
+        }
+        return;
+      }
+    } catch (_) {}
+    chatSubtitle.textContent = "غير متصل";
   }
 
   function formatLastSeen(iso) {
@@ -1288,6 +1931,34 @@
     });
     socket.on("typing", handleTypingEvent);
     socket.on("new_message", handleIncomingMessage);
+    socket.on("message_edited", (data) => {
+      try {
+        const msg = data?.message;
+        if (!msg || !msg.id) return;
+        const t = data?.type || (msg.group_id ? "group" : "dm");
+        const el = messagesDiv.querySelector(`.message[data-msg-id="${CSS.escape(String(msg.id))}"]`);
+        if (t === "group") groupMessageCache.set(String(msg.id), msg);
+        else messageCache.set(String(msg.id), msg);
+        if (el) {
+          const isSent = String(msg.sender_id) === String(currentUserId);
+          el.innerHTML = buildMessageInner(msg, isSent);
+        }
+      } catch (_) {}
+    });
+    socket.on("message_deleted", (data) => {
+      try {
+        if (!data || !data.message_id) return;
+        const id = String(data.message_id);
+        const el = messagesDiv.querySelector(`.message[data-msg-id="${CSS.escape(id)}"]`);
+        if (!el) return;
+        // Replace content with placeholder
+        const isSent = el.classList.contains("sender");
+        const msg = getMsgFromCache(data.type === "group" ? "group" : "dm", id) || { id: id, sender_id: (isSent ? currentUserId : null), content: "" };
+        msg.content = "تم حذف هذه الرسالة";
+        msg.message_type = "deleted";
+        el.innerHTML = buildMessageInner(msg, isSent);
+      } catch (_) {}
+    });
     socket.on("refresh_unread", () => refreshSidebarBadges());
   }
 
@@ -1391,6 +2062,43 @@
     const content = messageInput.value.trim();
     if (!content) return;
     hideEmptyState();
+
+    // Edit mode
+    const editId = (editMessageIdInput?.value || "").trim();
+    if (editId) {
+      try {
+        const endpoint = currentGroupId ? `/api/group_messages/${editId}/edit` : `/api/messages/${editId}/edit`;
+        const r = await fetch(endpoint, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "same-origin",
+          body: JSON.stringify({ content })
+        });
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok || !j || !j.ok) throw new Error("bad");
+        // Update DOM if exists
+        const el = messagesDiv.querySelector(`.message[data-msg-id="${CSS.escape(String(editId))}"]`);
+        if (el) {
+          const msg = getMsgFromCache(currentGroupId ? "group" : "dm", String(editId)) || {};
+          msg.content = content;
+          msg.edited_at = j.edited_at || new Date().toISOString();
+          if (currentGroupId) groupMessageCache.set(String(editId), msg);
+          else messageCache.set(String(editId), msg);
+          const isSent = true;
+          el.innerHTML = buildMessageInner(msg, isSent);
+        }
+        showToast("تم تعديل الرسالة", "success");
+      } catch (_) {
+        showToast("تعذر تعديل الرسالة", "error");
+      } finally {
+        clearEdit();
+        messageInput.value = "";
+        messageInput.focus();
+      }
+      return;
+    }
+
+    const replyToId = (replyToInput?.value || "").trim();
     const tempId = "temp-" + Date.now();
     const tempMsg = {
       id: tempId,
@@ -1398,6 +2106,7 @@
       receiver_id: currentReceiverId,
       content,
       message_type: "text",
+      reply_to_id: replyToId ? replyToId : null,
       timestamp_ms: Date.now(),
       timestamp: new Date().toLocaleTimeString("ar-EG", { hour: "2-digit", minute: "2-digit" }),
       date: new Date().toISOString().split("T")[0],
@@ -1418,6 +2127,7 @@
     try {
       const formData = new FormData();
       formData.append("content", content);
+      if (replyToId) formData.append("reply_to_id", replyToId);
       let endpoint = "/send_message";
       if (currentGroupId) {
         endpoint = "/send_group_message";
@@ -1458,6 +2168,7 @@
         tempDiv.innerHTML += `<div class="message-time" style="color:#dc3545;">⚠️ فشل الإرسال</div>`;
       }
     } finally {
+      if (replyToId) clearReply();
       messageInput.focus();
     }
   }
@@ -2113,9 +2824,233 @@
 
   // ====== Initialization ======
 
+
+  // ===== Conversation actions (pin/archive/mute) =====
+  function hideConvMenu() {
+    const m = document.getElementById("convCtxMenu");
+    if (m) m.remove();
+    document.removeEventListener("click", hideConvMenu, true);
+    document.removeEventListener("contextmenu", hideConvMenu, true);
+  }
+
+  async function postConversationSettings(li, payload) {
+    const isGroup = !!li.getAttribute("data-group-id");
+    const id = isGroup ? li.getAttribute("data-group-id") : li.getAttribute("data-user-id");
+    const type = isGroup ? "group" : "dm";
+    const res = await fetch(`/api/conversations/${type}/${id}/settings`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload || {})
+    });
+    const j = await res.json().catch(() => ({}));
+    if (!res.ok || !j.ok) throw new Error(j.error || "request_failed");
+  }
+
+  function showConvMenuFor(li, x, y) {
+    hideConvMenu();
+    const menu = document.createElement("div");
+    menu.id = "convCtxMenu";
+    menu.style.position = "fixed";
+    menu.style.left = Math.max(8, Math.min(x, window.innerWidth - 240)) + "px";
+    menu.style.top = Math.max(8, Math.min(y, window.innerHeight - 260)) + "px";
+    menu.style.width = "220px";
+    menu.style.background = "rgba(255,255,255,0.98)";
+    menu.style.border = "1px solid rgba(0,0,0,0.08)";
+    menu.style.boxShadow = "0 10px 30px rgba(0,0,0,0.18)";
+    menu.style.borderRadius = "12px";
+    menu.style.zIndex = "9999";
+    menu.style.padding = "8px";
+
+    const pinRaw = (li.getAttribute("data-pinned-rank") || "").trim();
+    const isPinned = pinRaw !== "";
+    const isArchived = (li.getAttribute("data-archived") || "0") === "1";
+
+    const makeBtn = (txt, cls) => {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "btn btn-sm w-100 text-start " + (cls || "btn-light");
+      b.style.margin = "4px 0";
+      b.textContent = txt;
+      return b;
+    };
+
+    const btnPin = makeBtn(isPinned ? "إلغاء التثبيت" : "تثبيت المحادثة");
+    btnPin.addEventListener("click", async () => {
+      try {
+        await postConversationSettings(li, { pinned_rank: isPinned ? null : 1 });
+        li.setAttribute("data-pinned-rank", isPinned ? "" : "1");
+        updateConversationFlags(li);
+        reorderConversationList();
+      } catch (e) {
+        showToast("تعذر تحديث التثبيت", "error");
+      } finally { hideConvMenu(); }
+    });
+
+    const btnArch = makeBtn(isArchived ? "إلغاء الأرشفة" : "أرشفة المحادثة");
+    btnArch.addEventListener("click", async () => {
+      try {
+        await postConversationSettings(li, { is_archived: !isArchived });
+        li.setAttribute("data-archived", (!isArchived) ? "1" : "0");
+        updateConversationFlags(li);
+        reorderConversationList();
+      } catch (e) {
+        showToast("تعذر تحديث الأرشفة", "error");
+      } finally { hideConvMenu(); }
+    });
+
+    const btnMute8h = makeBtn("كتم 8 ساعات");
+    btnMute8h.addEventListener("click", async () => {
+      try {
+        await postConversationSettings(li, { muted_until: 8 * 60 * 60 });
+        const d = new Date(Date.now() + 8 * 60 * 60 * 1000);
+        li.setAttribute("data-muted-until", d.toISOString());
+        updateConversationFlags(li);
+      } catch (e) {
+        showToast("تعذر تحديث الكتم", "error");
+      } finally { hideConvMenu(); }
+    });
+
+    const btnMute1w = makeBtn("كتم أسبوع");
+    btnMute1w.addEventListener("click", async () => {
+      try {
+        await postConversationSettings(li, { muted_until: 7 * 24 * 60 * 60 });
+        const d = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+        li.setAttribute("data-muted-until", d.toISOString());
+        updateConversationFlags(li);
+      } catch (e) {
+        showToast("تعذر تحديث الكتم", "error");
+      } finally { hideConvMenu(); }
+    });
+
+    const btnUnmute = makeBtn("إلغاء الكتم");
+    btnUnmute.addEventListener("click", async () => {
+      try {
+        await postConversationSettings(li, { muted_until: null });
+        li.setAttribute("data-muted-until", "");
+        updateConversationFlags(li);
+      } catch (e) {
+        showToast("تعذر إلغاء الكتم", "error");
+      } finally { hideConvMenu(); }
+    });
+
+    menu.appendChild(btnPin);
+    menu.appendChild(btnArch);
+
+    const hr = document.createElement("div");
+    hr.style.height = "1px";
+    hr.style.background = "rgba(0,0,0,0.08)";
+    hr.style.margin = "6px 0";
+    menu.appendChild(hr);
+
+    menu.appendChild(btnMute8h);
+    menu.appendChild(btnMute1w);
+    menu.appendChild(btnUnmute);
+
+    document.body.appendChild(menu);
+
+    setTimeout(() => {
+      document.addEventListener("click", hideConvMenu, true);
+      document.addEventListener("contextmenu", hideConvMenu, true);
+    }, 0);
+  }
+
+  function initConversationContextMenu() {
+    const ul = document.getElementById("users-list");
+    if (!ul) return;
+
+    ul.addEventListener("contextmenu", (ev) => {
+      const li = ev.target?.closest?.('li.user-item[data-user-id], li.user-item[data-group-id]');
+      if (!li) return;
+      // don't open menu for special items
+      if (li.id === "btnAddGroup" || li.id === "btnGroupInvites") return;
+      ev.preventDefault();
+      showConvMenuFor(li, ev.clientX, ev.clientY);
+    });
+
+    // initial flags
+    Array.from(ul.querySelectorAll('li.user-item[data-user-id], li.user-item[data-group-id]')).forEach(updateConversationFlags);
+    reorderConversationList();
+  }
+
+  // ===== Search modal =====
+  function initSearchModalUI() {
+    const btn = document.getElementById("btnSearch");
+    const modalEl = document.getElementById("modalSearch");
+    const input = document.getElementById("searchQuery");
+    const resultsEl = document.getElementById("searchResults");
+    if (!btn || !modalEl || !input || !resultsEl || typeof bootstrap === "undefined") return;
+
+    const modal = new bootstrap.Modal(modalEl);
+
+    btn.addEventListener("click", () => {
+      if (!currentReceiverId && !currentGroupId) {
+        showToast("اختر محادثة أولاً", "info");
+        return;
+      }
+      resultsEl.innerHTML = "";
+      input.value = "";
+      modal.show();
+      setTimeout(() => input.focus(), 150);
+    });
+
+    let timer = null;
+    input.addEventListener("input", () => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(async () => {
+        const q = (input.value || "").trim();
+        resultsEl.innerHTML = "";
+        if (q.length < 2) return;
+
+        const type = currentGroupId ? "group" : "dm";
+        const id = currentGroupId ? currentGroupId : currentReceiverId;
+
+        try {
+          const res = await fetch(`/api/search_messages?type=${encodeURIComponent(type)}&id=${encodeURIComponent(id)}&q=${encodeURIComponent(q)}`);
+          const j = await res.json();
+          if (!res.ok || !j.ok) throw new Error(j.error || "search_failed");
+          const items = j.results || [];
+          if (!items.length) {
+            resultsEl.innerHTML = '<div class="text-muted">لا توجد نتائج</div>';
+            return;
+          }
+          items.forEach((it) => {
+            const card = document.createElement("div");
+            card.className = "p-2 border rounded";
+            const ts = it.timestamp ? new Date(it.timestamp).toLocaleString("ar") : "";
+            card.innerHTML = `<div style="font-size:12px;opacity:.75">${ts}</div><div>${escapeHtml(it.content || "")}</div>`;
+            card.style.cursor = "pointer";
+            card.addEventListener("click", () => {
+              modal.hide();
+              // Best effort: if message is currently in DOM, scroll to it
+              const msgEl = document.querySelector(`[data-msg-id="${it.id}"]`);
+              if (msgEl) {
+                msgEl.scrollIntoView({ behavior: "smooth", block: "center" });
+                msgEl.classList.add("highlight");
+                setTimeout(() => msgEl.classList.remove("highlight"), 1500);
+              } else {
+                showToast("الرسالة قد تكون خارج الجزء المحمّل. مرّر للأعلى لتحميل المزيد ثم ابحث.", "info");
+              }
+            });
+            resultsEl.appendChild(card);
+          });
+        } catch (e) {
+          resultsEl.innerHTML = '<div class="text-danger">تعذر البحث</div>';
+        }
+      }, 350);
+    });
+  }
+
+
   document.addEventListener("DOMContentLoaded", () => {
     const bodyId = document.body.getAttribute("data-user-id");
     if (bodyId) currentUserId = parseInt(bodyId, 10);
+
+    // Persist basic profile locally (helps auto-fill/login UX)
+    try {
+      const nm = document.body.getAttribute("data-user-name") || "";
+      const ph = document.body.getAttribute("data-user-phone") || "";
+      localStorage.setItem("chat_user_profile", JSON.stringify({ id: currentUserId, name: nm, phone: ph }));
+    } catch (_) {}
 
     if ("PerformanceObserver" in window) {
       try {
@@ -2133,6 +3068,10 @@
     requestNotificationPermission();
     initNotificationSettingsUI();
     initSocket();
+    initMessageActionsUI();
+    initHeaderModalsUI();
+    initConversationContextMenu();
+    initSearchModalUI();
     // Auto-enable Push subscription if user enabled it previously
     if (readPushEnabled()) {
       ensurePushSubscription().then((ok) => {

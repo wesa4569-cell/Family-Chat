@@ -56,26 +56,10 @@ app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1)
 # this makes Flask aware of the original scheme/host (needed for secure cookies, redirects, etc.).
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 
-# Security: use env var in production. If missing, persist a generated key under
-# instance/secret_key.txt so sessions do not break after restarts.
-_env_secret = os.environ.get("SECRET_KEY")
-if _env_secret:
-    app.secret_key = _env_secret
-else:
-    try:
-        os.makedirs(app.instance_path, exist_ok=True)
-        _secret_path = os.path.join(app.instance_path, "secret_key.txt")
-        if os.path.exists(_secret_path):
-            with open(_secret_path, "r", encoding="utf-8") as f:
-                app.secret_key = (f.read() or "").strip() or None
-        if not getattr(app, "secret_key", None):
-            import secrets
-            app.secret_key = secrets.token_urlsafe(64)
-            with open(_secret_path, "w", encoding="utf-8") as f:
-                f.write(app.secret_key)
-    except Exception:
-        # Fallback (not ideal): sessions may reset on restart.
-        app.secret_key = "dev-secret-key-change-in-production"
+# Security: use env var in production
+app.secret_key = os.environ.get("SECRET_KEY") or "dev-secret-key-change-in-production"
+
+# In production, you should set a strong SECRET_KEY via environment variables.
 
 
 # DB
@@ -94,6 +78,10 @@ app.config["ALLOWED_EXTENSIONS"] = {"png", "jpg", "jpeg", "gif"}
 # Session cookies (improve security; safe defaults for prod)
 app.config["SESSION_COOKIE_HTTPONLY"] = True
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+# Default "remember me" session lifetime (can be overridden at login).
+app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=int(os.environ.get("SESSION_DAYS", "30")))
+# Refresh session expiry on activity so the user stays logged in while active.
+app.config["SESSION_REFRESH_EACH_REQUEST"] = True
 # إذا تستخدم HTTPS في الإنتاج فعّلها:
 # app.config["SESSION_COOKIE_SECURE"] = True
 
@@ -185,7 +173,7 @@ def _serialize_message(msg, sender_name: Optional[str] = None) -> dict:
         if not sender:
             sender = db.session.get(User, getattr(msg, "sender_id", None))
         sender_name = sender.name if sender else ""
-    return {
+    payload = {
         "id": msg.id,
         "sender_id": getattr(msg, "sender_id", None),
         "receiver_id": getattr(msg, "receiver_id", None),
@@ -197,13 +185,6 @@ def _serialize_message(msg, sender_name: Optional[str] = None) -> dict:
         "message_type": getattr(msg, "message_type", "text"),
         "media_url": getattr(msg, "media_url", None),
         "media_mime": getattr(msg, "media_mime", None),
-        "is_read": getattr(msg, "is_read", False),
-        "delivered_at": _utc_iso(getattr(msg, "delivered_at", None)),
-        "read_at": _utc_iso(getattr(msg, "read_at", None)),
-        "edited_at": _utc_iso(getattr(msg, "edited_at", None)),
-        "deleted_for_all": bool(getattr(msg, "deleted_for_all", False)),
-        "reply_to_id": getattr(msg, "reply_to_id", None),
-        "forwarded": bool(getattr(msg, "forwarded", False)),
     }
 
 
@@ -368,23 +349,6 @@ class PushSubscription(db.Model):
     updated_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None), onupdate=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
 
     __table_args__ = (db.UniqueConstraint('user_id', 'endpoint', name='uq_push_user_endpoint'),)
-
-
-class MessageReaction(db.Model):
-    __tablename__ = "message_reactions"
-
-    id = db.Column(db.Integer, primary_key=True)
-    message_id = db.Column(db.Integer, nullable=False, index=True)
-    user_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False, index=True)
-    emoji = db.Column(db.String(32), nullable=False)
-    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None), index=True)
-
-    user = db.relationship("User", foreign_keys=[user_id])
-
-    __table_args__ = (
-        db.UniqueConstraint("message_id", "user_id", "emoji", name="uq_react_msg_user_emoji"),
-        db.Index("ix_react_msg_user", "message_id", "user_id"),
-    )
 
 
 # ----------------- Socket.IO Events -----------------
@@ -741,6 +705,10 @@ def manifest_root():
 def home():
     # الصفحة الرئيسية تعرض المحادثات إذا كان المستخدم مسجلاً
     if login_required():
+        next_url = (request.args.get("next") or "").strip()
+        # Basic open-redirect protection: only allow relative paths
+        if next_url and next_url.startswith("/") and not next_url.startswith("//"):
+            return redirect(next_url)
         return redirect(url_for("web_chat"))
     return render_template("home.html")
 
@@ -761,6 +729,7 @@ class GroupMember(db.Model):
     group_id = db.Column(db.Integer, db.ForeignKey("groups.id"), nullable=False, index=True)
     user_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False, index=True)
     status = db.Column(db.String(20), default="pending", index=True)  # pending / accepted / declined
+    role = db.Column(db.String(20), default="member", index=True)  # owner / admin / member
     invited_by = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
     invited_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None), index=True)
     responded_at = db.Column(db.DateTime, nullable=True)
@@ -791,6 +760,11 @@ class GroupMessage(db.Model):
     media_url = db.Column(db.Text, nullable=True)
     media_mime = db.Column(db.String(100), nullable=True)
     timestamp = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None), index=True)
+    edited_at = db.Column(db.DateTime, nullable=True, index=True)
+    deleted_for_all = db.Column(db.Boolean, default=False, index=True)
+    reply_to_id = db.Column(db.Integer, nullable=True, index=True)
+    message_kind = db.Column(db.String(20), default="user", index=True)  # user / system
+    system_payload = db.Column(db.Text, nullable=True)
 
     group = db.relationship("Group", foreign_keys=[group_id])
     sender = db.relationship("User", foreign_keys=[sender_id])
@@ -798,83 +772,6 @@ class GroupMessage(db.Model):
     __table_args__ = (
         db.Index("ix_group_messages_group_ts", "group_id", "timestamp"),
     )
-
-
-# ----------------- DB schema safety (no Alembic) -----------------
-def _db_is_sqlite() -> bool:
-    try:
-        return db.engine.dialect.name == "sqlite"
-    except Exception:
-        return False
-
-
-def _ensure_columns_sqlite(table: str, columns: list[tuple[str, str]]):
-    """Add missing columns to an existing SQLite table.
-
-    NOTE: SQLite supports ALTER TABLE ADD COLUMN (at the end). We keep defaults simple
-    and NULL-friendly to avoid breaking running deployments.
-    """
-    try:
-        rows = db.session.execute(db.text(f"PRAGMA table_info({table});")).fetchall()
-        existing = {r[1] for r in rows}  # name is 2nd field
-        for name, decl in columns:
-            if name in existing:
-                continue
-            db.session.execute(db.text(f"ALTER TABLE {table} ADD COLUMN {name} {decl};"))
-        db.session.commit()
-    except Exception:
-        db.session.rollback()
-
-
-def _ensure_columns_postgres(table: str, columns: list[tuple[str, str]]):
-    try:
-        for name, decl in columns:
-            db.session.execute(db.text(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {name} {decl};"))
-        db.session.commit()
-    except Exception:
-        db.session.rollback()
-
-
-_schema_checked = False
-
-@app.before_request
-def _ensure_schema_once():
-    """Ensure new columns/tables exist without requiring a migration tool."""
-    global _schema_checked
-    if _schema_checked:
-        return
-    _schema_checked = True
-
-    try:
-        db.create_all()
-    except Exception:
-        # If create_all fails (permissions etc.), we still try to continue.
-        pass
-
-    # Add columns for Message (WhatsApp-like status/reply/forward/edit/delete)
-    msg_cols = [
-        ("delivered_at", "DATETIME"),
-        ("read_at", "DATETIME"),
-        ("edited_at", "DATETIME"),
-        ("deleted_for_all", "BOOLEAN DEFAULT 0"),
-        ("reply_to_id", "INTEGER"),
-        ("forwarded", "BOOLEAN DEFAULT 0"),
-    ]
-
-    # SQLite vs Postgres declarations
-    if _db_is_sqlite():
-        _ensure_columns_sqlite("messages", msg_cols)
-    else:
-        pg_cols = [
-            ("delivered_at", "TIMESTAMP"),
-            ("read_at", "TIMESTAMP"),
-            ("edited_at", "TIMESTAMP"),
-            ("deleted_for_all", "BOOLEAN DEFAULT FALSE"),
-            ("reply_to_id", "INTEGER"),
-            ("forwarded", "BOOLEAN DEFAULT FALSE"),
-        ]
-        _ensure_columns_postgres("messages", pg_cols)
-
 
 
 
@@ -960,7 +857,6 @@ def login():
     if request.method == "POST":
         phone = (request.form.get("phone") or "").strip()
         password = request.form.get("password") or ""
-        remember = (request.form.get("remember") or "on").lower() in ("1", "true", "on", "yes")
 
         if not phone or not password:
             return render_template("login.html", error="جميع الحقول مطلوبة")
@@ -973,8 +869,6 @@ def login():
         session["user_id"] = user.id
         session["phone_number"] = user.phone_number
         session["name"] = user.name
-        # Make session persist across restarts when "remember" is enabled.
-        session.permanent = bool(remember)
 
         try:
             user.touch_last_seen()
@@ -1092,17 +986,58 @@ def web_chat():
     if active_user and not any(c.get("type") == "user" and c.get("user").id == active_user.id for c in conversations):
         conversations.append({"type": "user", "user": active_user, "ts": None})
 
-    # ترتيب ثابت أولًا ثم حسب آخر رسالة (تنازليًا)
+    
+    # Attach conversation settings (pin/archive/mute) for current user
+    conv_keys = []
+    for c in conversations:
+        if c.get("type") == "group":
+            conv_keys.append(("group", int(c.get("group").id)))
+        else:
+            conv_keys.append(("dm", int(c.get("user").id)))
+    settings_rows = (
+        ConversationSetting.query
+        .filter(ConversationSetting.user_id == user.id)
+        .filter(
+            or_(
+                and_(ConversationSetting.conversation_type == "group", ConversationSetting.conversation_id.in_([cid for t, cid in conv_keys if t == "group"] or [-1])),
+                and_(ConversationSetting.conversation_type == "dm", ConversationSetting.conversation_id.in_([cid for t, cid in conv_keys if t == "dm"] or [-1])),
+            )
+        )
+        .all()
+    )
+    settings_map = {(r.conversation_type, int(r.conversation_id)): r for r in settings_rows}
+    for c in conversations:
+        if c.get("type") == "group":
+            c["settings"] = settings_map.get(("group", int(c.get("group").id)))
+        else:
+            c["settings"] = settings_map.get(("dm", int(c.get("user").id)))
+
+    # ترتيب مثل واتساب: المثبت أولاً (حسب pinned_rank) ثم حسب آخر رسالة، والأرشيف في الأسفل
+    def _conv_name(it):
+        if it.get("type") == "user":
+            return ((it.get("user").name or "").lower(), int(it.get("user").id))
+        return ((it.get("group").name or "").lower(), int(it.get("group").id))
+
+    def _pinned_rank(it):
+        s = it.get("settings")
+        if s and s.pinned_rank is not None:
+            return int(s.pinned_rank)
+        return 10**9
+
+    def _is_archived(it):
+        s = it.get("settings")
+        return bool(s and s.is_archived)
+
+    conversations.sort(key=lambda it: (_conv_name(it)))
     conversations.sort(
         key=lambda it: (
-            ((it.get("user").name or "").lower() if it.get("type") == "user" else (it.get("group").name or "").lower()),
-            (it.get("user").id if it.get("type") == "user" else it.get("group").id),
+            _is_archived(it),                 # archived last
+            _pinned_rank(it),                 # pinned first
+            not (it.get("ts") is not None),   # ts present first
+            -(it.get("ts").timestamp() if it.get("ts") else 0.0),
         )
     )
-    conversations.sort(
-        key=lambda it: (it.get("ts") is not None, it.get("ts") or datetime.min),
-        reverse=True,
-    )
+
 
     if CONVERSATION_PREVIEW_LIMIT and len(conversations) > CONVERSATION_PREVIEW_LIMIT:
         limited = conversations[:CONVERSATION_PREVIEW_LIMIT]
@@ -1240,7 +1175,7 @@ def create_group():
         db.session.flush()
 
         # أضف المالك كعضو accepted
-        db.session.add(GroupMember(group_id=g.id, user_id=me.id, status="accepted", invited_by=me.id))
+        db.session.add(GroupMember(group_id=g.id, user_id=me.id, status="accepted", invited_by=me.id, role="owner"))
 
         # أضف الأعضاء كطلبات pending + أرسل لهم رسالة دعوة
         for uid in members:
@@ -1392,6 +1327,65 @@ def api_group_update(group_id):
         return jsonify({"ok": False, "error": "db_error"}), 500
 
 
+@app.route("/api/groups/<int:group_id>/members/<int:user_id>/promote", methods=["POST"])
+def api_group_promote_member(group_id: int, user_id: int):
+    if not login_required():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    me = current_user()
+    if not me:
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    g = db.session.get(Group, group_id)
+    if not g:
+        return jsonify({"ok": False, "error": "group_not_found"}), 404
+    my = GroupMember.query.filter_by(group_id=group_id, user_id=me.id, status="accepted").first()
+    if not my:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    # Owner can promote/demote; admins can only remove/ban in future (not here).
+    if my.role != "owner":
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    target = GroupMember.query.filter_by(group_id=group_id, user_id=user_id).first()
+    if not target or target.status != "accepted":
+        return jsonify({"ok": False, "error": "not_found"}), 404
+    if target.role == "owner":
+        return jsonify({"ok": False, "error": "cannot_change_owner"}), 400
+    target.role = "admin"
+    try:
+        db.session.commit()
+        # System message
+        db.session.add(GroupMessage(group_id=group_id, sender_id=me.id, content=f"تمت ترقية العضو {user_id} إلى مشرف", message_type="system", message_kind="system"))
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+        return jsonify({"ok": False, "error": "db_error"}), 500
+    return jsonify({"ok": True})
+
+
+@app.route("/api/groups/<int:group_id>/members/<int:user_id>/demote", methods=["POST"])
+def api_group_demote_member(group_id: int, user_id: int):
+    if not login_required():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    me = current_user()
+    if not me:
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    my = GroupMember.query.filter_by(group_id=group_id, user_id=me.id, status="accepted").first()
+    if not my or my.role != "owner":
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    target = GroupMember.query.filter_by(group_id=group_id, user_id=user_id).first()
+    if not target or target.status != "accepted":
+        return jsonify({"ok": False, "error": "not_found"}), 404
+    if target.role == "owner":
+        return jsonify({"ok": False, "error": "cannot_change_owner"}), 400
+    target.role = "member"
+    try:
+        db.session.commit()
+        db.session.add(GroupMessage(group_id=group_id, sender_id=me.id, content=f"تمت إزالة صلاحيات المشرف عن العضو {user_id}", message_type="system", message_kind="system"))
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+        return jsonify({"ok": False, "error": "db_error"}), 500
+    return jsonify({"ok": True})
+
+
 @app.route("/api/groups/<int:group_id>/delete", methods=["POST"])
 def api_group_delete(group_id):
     if not login_required():
@@ -1501,6 +1495,84 @@ def api_group_block(group_id):
         return jsonify({"ok": False, "error": "db_error"}), 500
 
 
+@app.route("/api/groups/<int:group_id>/invite_link", methods=["POST"])
+def api_group_invite_link(group_id: int):
+    if not login_required():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    me = current_user()
+    if not me:
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    g = db.session.get(Group, group_id)
+    if not g:
+        return jsonify({"ok": False, "error": "group_not_found"}), 404
+    member = GroupMember.query.filter_by(group_id=group_id, user_id=me.id, status="accepted").first()
+    if not member:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    # Only owner/admin can create invite links
+    if member.role not in {"owner", "admin"}:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    data = request.get_json(silent=True) or {}
+    expires_seconds = data.get("expires_seconds")
+    max_uses = data.get("max_uses")
+    try:
+        expires_at = None
+        if expires_seconds:
+            expires_at = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(seconds=int(expires_seconds))
+        max_uses_i = int(max_uses) if max_uses is not None and str(max_uses).strip() != "" else None
+    except Exception:
+        expires_at = None
+        max_uses_i = None
+
+    import secrets
+    token = secrets.token_urlsafe(32)
+    try:
+        row = GroupInviteLink(group_id=group_id, token=token, expires_at=expires_at, max_uses=max_uses_i, uses=0, created_by=me.id)
+        db.session.add(row)
+        db.session.commit()
+        return jsonify({"ok": True, "token": token, "url": f"/join/{token}"})
+    except Exception:
+        db.session.rollback()
+        return jsonify({"ok": False, "error": "db_error"}), 500
+
+
+@app.route("/join/<string:token>")
+def join_by_token(token: str):
+    # If not logged in, redirect to login then back to join
+    if not login_required():
+        return redirect(url_for("login", next=url_for("join_by_token", token=token)))
+    me = current_user()
+    if not me:
+        session.clear()
+        return redirect(url_for("login", next=url_for("join_by_token", token=token)))
+
+    link = GroupInviteLink.query.filter_by(token=token).first()
+    if not link:
+        return render_template("home.html", error="رابط الدعوة غير صالح")
+    if link.expires_at and datetime.now(timezone.utc).replace(tzinfo=None) > link.expires_at:
+        return render_template("home.html", error="انتهت صلاحية رابط الدعوة")
+    if link.max_uses is not None and int(link.uses) >= int(link.max_uses):
+        return render_template("home.html", error="تم استهلاك رابط الدعوة")
+
+    g = db.session.get(Group, link.group_id)
+    if not g:
+        return render_template("home.html", error="المجموعة غير موجودة")
+
+    try:
+        gm = GroupMember.query.filter_by(group_id=g.id, user_id=me.id).first()
+        if not gm:
+            gm = GroupMember(group_id=g.id, user_id=me.id, status="accepted", invited_by=link.created_by, role="member")
+            db.session.add(gm)
+        else:
+            gm.status = "accepted"
+        link.uses = int(link.uses or 0) + 1
+        db.session.commit()
+        return redirect(url_for("web_chat", group=g.id))
+    except Exception:
+        db.session.rollback()
+        return render_template("home.html", error="تعذر الانضمام للمجموعة")
+
+
 
 @app.route("/get_group_messages/<int:group_id>")
 def get_group_messages(group_id: int):
@@ -1542,8 +1614,35 @@ def get_group_messages(group_id: int):
         q = q.filter(GroupMessage.id > min_id)
         messages = q.order_by(GroupMessage.timestamp.asc(), GroupMessage.id.asc()).all()
 
+    # Filter "delete for me" visibilities for group messages
+    try:
+        deleted_ids = {
+            int(r[0]) for r in db.session.query(MessageVisibility.message_id)
+            .filter_by(user_id=me.id, message_type="group", is_deleted_for_me=True)
+            .all()
+        }
+    except Exception:
+        deleted_ids = set()
+
     res = []
     for m in messages:
+        if int(m.id) in deleted_ids:
+            continue
+        # Group read receipts (best-effort): mark read for this user
+        try:
+            if int(m.sender_id) != int(me.id):
+                now = datetime.now(timezone.utc).replace(tzinfo=None)
+                rec = GroupMessageReceipt.query.filter_by(group_message_id=m.id, user_id=me.id).first()
+                if not rec:
+                    rec = GroupMessageReceipt(group_message_id=m.id, user_id=me.id, delivered_at=now, read_at=now)
+                    db.session.add(rec)
+                else:
+                    if rec.delivered_at is None:
+                        rec.delivered_at = now
+                    if rec.read_at is None:
+                        rec.read_at = now
+        except Exception:
+            pass
         res.append({
             "id": m.id,
             "sender_id": m.sender_id,
@@ -1568,6 +1667,32 @@ def get_group_messages(group_id: int):
     return jsonify(res)
 
 
+@app.route("/api/group_messages/<int:message_id>/delete_for_me", methods=["POST"])
+def api_group_message_delete_for_me(message_id: int):
+    if not login_required():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    me = current_user()
+    if not me:
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    msg = db.session.get(GroupMessage, message_id)
+    if not msg:
+        return jsonify({"ok": False, "error": "not_found"}), 404
+    member = GroupMember.query.filter_by(group_id=msg.group_id, user_id=me.id, status="accepted").first()
+    if not member:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    try:
+        row = MessageVisibility.query.filter_by(message_type="group", message_id=message_id, user_id=me.id).first()
+        if not row:
+            db.session.add(MessageVisibility(message_type="group", message_id=message_id, user_id=me.id, is_deleted_for_me=True))
+        else:
+            row.is_deleted_for_me = True
+        db.session.commit()
+        return jsonify({"ok": True})
+    except Exception:
+        db.session.rollback()
+        return jsonify({"ok": False, "error": "db_error"}), 500
+
+
 @app.route("/send_group_message", methods=["POST"])
 def send_group_message():
     if not login_required():
@@ -1578,6 +1703,7 @@ def send_group_message():
 
     group_id = (request.form.get("group_id") or "").strip()
     content = (request.form.get("content") or "").strip()
+    reply_to_raw = (request.form.get("reply_to_id") or "").strip()
     try:
         group_id = int(group_id)
     except Exception:
@@ -1590,30 +1716,38 @@ def send_group_message():
     if not content:
         return jsonify({"ok": False, "error": "empty"}), 400
 
-    msg = GroupMessage(group_id=group_id, sender_id=me.id, content=content, message_type="text")
+    # Optional reply_to_id: must exist inside the same group
+    reply_to_id = None
+    if reply_to_raw:
+        try:
+            rt = int(reply_to_raw)
+            rm = db.session.get(GroupMessage, rt)
+            if rm and int(rm.group_id) == int(group_id):
+                reply_to_id = rt
+        except Exception:
+            reply_to_id = None
+
+    msg = GroupMessage(group_id=group_id, sender_id=me.id, content=content, message_type="text", reply_to_id=reply_to_id)
     try:
         db.session.add(msg)
         db.session.commit()
 
-        # Web Push notification to other group members
+        # Detect mentions in message content (e.g., @+201234567890)
         try:
-            sender = User.query.get(me.id)
-            members = GroupMember.query.filter_by(group_id=group_id, status="accepted").all()
-            for mm in members:
-                if mm.user_id == me.id:
-                    continue
-                payload = {
-                    "title": "🎤 رسالة صوتية في المجموعة",
-                    "body": f"{(sender.name if sender else 'مستخدم')}: أرسل رسالة صوتية",
-                    "icon": "/static/logo.svg",
-                    "badge": "/static/logo.svg",
-                    "url": f"/chat?group={group_id}",
-                    "tag": f"group-{group_id}-{msg.id}",
-                    "meta": {"type": "group", "group_id": group_id, "sender_id": me.id, "message_id": msg.id}
-                }
-                send_push_to_user(mm.user_id, payload)
+            mentioned_users: set[int] = set()
+            for ph in re.findall(r"@\+?[0-9]{10,15}", content or ""):
+                phone = ph[1:]
+                u = User.query.filter_by(phone_number=phone).first()
+                if u and int(u.id) != int(me.id):
+                    mentioned_users.add(int(u.id))
+                    try:
+                        db.session.add(GroupMessageMention(group_message_id=msg.id, mentioned_user_id=int(u.id)))
+                    except Exception:
+                        pass
+            if mentioned_users:
+                db.session.commit()
         except Exception:
-            pass
+            db.session.rollback()
 
         # Web Push notification to other group members
         try:
@@ -1631,7 +1765,9 @@ def send_group_message():
                     "tag": f"group-{group_id}-{msg.id}",
                     "meta": {"type": "group", "group_id": group_id, "sender_id": me.id, "message_id": msg.id}
                 }
-                send_push_to_user(mm.user_id, payload)
+                if not is_conversation_muted(mm.user_id, 'group', group_id):
+
+                    send_push_to_user(mm.user_id, payload)
         except Exception:
             pass
 
@@ -1727,7 +1863,9 @@ def send_group_image():
                     "tag": f"group-{group_id}-{msg.id}",
                     "meta": {"type": "group", "group_id": group_id, "sender_id": me.id, "message_id": msg.id}
                 }
-                send_push_to_user(mm.user_id, payload)
+                if not is_conversation_muted(mm.user_id, 'group', group_id):
+
+                    send_push_to_user(mm.user_id, payload)
         except Exception:
             pass
 
@@ -1820,7 +1958,9 @@ def send_group_audio():
                     "tag": f"group-{group_id}-{msg.id}",
                     "meta": {"type": "group", "group_id": group_id, "sender_id": me.id, "message_id": msg.id}
                 }
-                send_push_to_user(mm.user_id, payload)
+                if not is_conversation_muted(mm.user_id, 'group', group_id):
+
+                    send_push_to_user(mm.user_id, payload)
         except Exception:
             pass
 
@@ -1913,7 +2053,9 @@ def send_group_file():
                     "tag": f"group-{group_id}-{msg.id}",
                     "meta": {"type": "group", "group_id": group_id, "sender_id": sender_id, "message_id": msg.id}
                 }
-                send_push_to_user(mm.user_id, payload)
+                if not is_conversation_muted(mm.user_id, 'group', group_id):
+
+                    send_push_to_user(mm.user_id, payload)
         except Exception:
             pass
 
@@ -2035,7 +2177,21 @@ def get_messages(other_user_id: int):
     except SQLAlchemyError:
         db.session.rollback()
 
-    return jsonify([_serialize_message(m) for m in msgs])
+    return jsonify([
+        {
+            "id": m.id,
+            "sender_id": m.sender_id,
+            "receiver_id": m.receiver_id,
+            "content": m.content,
+            "timestamp_iso": (m.timestamp.replace(tzinfo=timezone.utc).isoformat().replace("+00:00","Z") if m.timestamp else None),
+            "timestamp_ms": int((m.timestamp.replace(tzinfo=timezone.utc).timestamp()) * 1000) if m.timestamp else 0,
+            "is_read": m.is_read,
+            "message_type": getattr(m, "message_type", "text"),
+            "media_url": getattr(m, "media_url", None),
+            "media_mime": getattr(m, "media_mime", None),
+        }
+        for m in msgs
+    ])
 
 
 @app.route("/send_message", methods=["POST"])
@@ -2046,6 +2202,7 @@ def send_message():
     sender_id = session["user_id"]
     receiver_id_raw = request.form.get("receiver_id", "").strip()
     content = (request.form.get("content") or "").strip()
+    reply_to_raw = (request.form.get("reply_to_id") or "").strip()
 
     if not receiver_id_raw or not content:
         return jsonify({"error": "حقول ناقصة"}), 400
@@ -2061,8 +2218,22 @@ def send_message():
     if not db.session.get(User, receiver_id):
         return jsonify({"error": "المستخدم غير موجود"}), 404
 
+    # Validate reply_to_id (optional) - must belong to the same conversation
+    reply_to_id = None
+    if reply_to_raw:
+        try:
+            rt = int(reply_to_raw)
+            rm = db.session.get(Message, rt)
+            if rm and (
+                (rm.sender_id == sender_id and rm.receiver_id == receiver_id) or
+                (rm.sender_id == receiver_id and rm.receiver_id == sender_id)
+            ):
+                reply_to_id = rt
+        except Exception:
+            reply_to_id = None
+
     try:
-        msg = Message(sender_id=sender_id, receiver_id=receiver_id, content=content)
+        msg = Message(sender_id=sender_id, receiver_id=receiver_id, content=content, reply_to_id=reply_to_id)
         db.session.add(msg)
         db.session.commit()
 
@@ -2078,7 +2249,9 @@ def send_message():
                 "tag": f"dm-{msg.id}",
                 "meta": {"type": "dm", "sender_id": sender_id, "receiver_id": receiver_id, "message_id": msg.id}
             }
-            send_push_to_user(receiver_id, payload)
+            if not is_conversation_muted(receiver_id, 'dm', sender_id):
+
+                send_push_to_user(receiver_id, payload)
         except Exception:
             pass
 
@@ -2159,7 +2332,9 @@ def send_image():
                 "tag": f"dm-{msg.id}",
                 "meta": {"type": "dm", "sender_id": sender_id, "receiver_id": receiver_id, "message_id": msg.id}
             }
-            send_push_to_user(receiver_id, payload)
+            if not is_conversation_muted(receiver_id, 'dm', sender_id):
+
+                send_push_to_user(receiver_id, payload)
         except Exception:
             pass
 
@@ -2240,7 +2415,9 @@ def send_audio():
                 "tag": f"dm-{msg.id}",
                 "meta": {"type": "dm", "sender_id": sender_id, "receiver_id": receiver_id, "message_id": msg.id}
             }
-            send_push_to_user(receiver_id, payload)
+            if not is_conversation_muted(receiver_id, 'dm', sender_id):
+
+                send_push_to_user(receiver_id, payload)
         except Exception:
             pass
 
@@ -2321,7 +2498,9 @@ def send_file():
                 "tag": f"dm-{msg.id}",
                 "meta": {"type": "dm", "sender_id": sender_id, "receiver_id": receiver_id, "message_id": msg.id}
             }
-            send_push_to_user(receiver_id, payload)
+            if not is_conversation_muted(receiver_id, 'dm', sender_id):
+
+                send_push_to_user(receiver_id, payload)
         except Exception:
             pass
 
