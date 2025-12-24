@@ -811,7 +811,7 @@ def web_chat():
 
     dm_rows = (
         db.session.query(User, dm_last_subq.c.last_ts)
-        .join(dm_last_subq, dm_last_subq.c.other_id == User.id)
+        .outerjoin(dm_last_subq, dm_last_subq.c.other_id == User.id)
         .filter(User.id != user.id)
         .order_by(dm_last_subq.c.last_ts.desc().nullslast(), User.id.desc())
         .all()
