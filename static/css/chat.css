@@ -202,6 +202,19 @@ html, body {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+#netStatus {
+  font-size: 12px;
+  opacity: 0.85;
+  white-space: nowrap;
+}
+.typing-indicator {
+  font-size: 12px;
+  opacity: 0.9;
+  display: none;
+}
+.typing-indicator.active {
+  display: inline-flex;
+}
 
 /* زر Drawer (المحادثات) */
 .menu-btn {
