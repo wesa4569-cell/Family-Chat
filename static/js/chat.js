@@ -725,26 +725,38 @@
     const isGroup = Boolean(currentGroupId || msg.group_id);
     const senderName = (msg.sender_name || msg.sender || "").trim();
     const senderLine = (isGroup && !isSent && senderName) ? `<div class="msg-sender">${escapeHtml(senderName)}</div>` : "";
+    const statusHtml = buildStatusHtml(msg, isSent, isGroup);
+    const timeLine = `<div class="message-time">${t}${statusHtml}</div>`;
+
+    // Reply quote (if API provides reply_to)
+    let quoteHtml = "";
+    try {
+      if (msg.reply_to && (msg.reply_to.content || msg.reply_to.id)) {
+        const qName = escapeHtml((msg.reply_to.sender_name || "").toString());
+        const qText = escapeHtml((msg.reply_to.content || "").toString());
+        quoteHtml = `<div class="msg-reply-quote" data-reply-to="${escapeHtml(String(msg.reply_to.id || ""))}"><div class="q-name">${qName || "رسالة"}</div><div class="q-snippet">${qText || ""}</div></div>`;
+      }
+    } catch (_) {}
 
     if (type === "image" && mediaUrl) {
       const safeUrl = escapeHtml(mediaUrl);
-      return `${senderLine}<div class="media-wrap"><a href="${safeUrl}" target="_blank" rel="noopener"><img class="msg-image" src="${safeUrl}" alt="image" loading="lazy"></a></div><div class="message-time">${t}</div>`;
+      return `${senderLine}${quoteHtml}<div class="media-wrap"><a href="${safeUrl}" target="_blank" rel="noopener"><img class="msg-image" src="${safeUrl}" alt="image" loading="lazy"></a></div>${timeLine}`;
     }
     if (type === "audio" && mediaUrl) {
       const safeUrl = escapeHtml(mediaUrl);
-      return `${senderLine}<div class="media-wrap"><audio controls preload="none" src="${safeUrl}"></audio></div><div class="message-time">${t}</div>`;
+      return `${senderLine}${quoteHtml}<div class="media-wrap"><audio controls preload="none" src="${safeUrl}"></audio></div>${timeLine}`;
     }
     if ((type === "video" || (type === "file" && (msg.media_mime || "").toLowerCase().startsWith("video/"))) && mediaUrl) {
       const safeUrl = escapeHtml(mediaUrl);
-      return `${senderLine}<div class="media-wrap"><video controls preload="metadata" src="${safeUrl}" style="max-width:100%;border-radius:12px;"></video></div><div class="message-time">${t}</div>`;
+      return `${senderLine}${quoteHtml}<div class="media-wrap"><video controls preload="metadata" src="${safeUrl}" style="max-width:100%;border-radius:12px;"></video></div>${timeLine}`;
     }
     if (type === "file" && mediaUrl) {
       const safeUrl = escapeHtml(mediaUrl);
       const fname = escapeHtml(msg.content || "ملف");
       const mime2 = escapeHtml(msg.media_mime || "");
-      return `${senderLine}<div class="file-wrap"><a class="file-link" href="${safeUrl}" target="_blank" rel="noopener"><i class="bi bi-paperclip"></i><span class="file-name">${fname}</span></a>${mime2 ? `<div class="file-mime">${mime2}</div>` : ``}</div><div class="message-time">${t}</div>`;
+      return `${senderLine}${quoteHtml}<div class="file-wrap"><a class="file-link" href="${safeUrl}" target="_blank" rel="noopener"><i class="bi bi-paperclip"></i><span class="file-name">${fname}</span></a>${mime2 ? `<div class="file-mime">${mime2}</div>` : ``}</div>${timeLine}`;
     }
-    return `${senderLine}<div>${escapeHtml(msg.content || "")}</div><div class="message-time">${t}</div>`;
+    return `${senderLine}${quoteHtml}<div>${escapeHtml(msg.content || "")}</div>${timeLine}`;
   }
 
   function pruneOldMessages() {
@@ -1670,58 +1682,6 @@
     // لا نعرض حالة تواجد المستخدم هنا لتجنب تكرارها؛
     // التواجد يعرض أسفل الاسم عبر chatSubtitle.
     netStatus.textContent = "";
-  }
-
-  function formatLastSeen(iso) {
-    if (!iso) return "";
-    try {
-      const d = new Date(iso);
-      if (Number.isNaN(d.getTime())) return "";
-      const now = new Date();
-      const dateKey = d.toISOString().split("T")[0];
-      const todayKey = now.toISOString().split("T")[0];
-      const yKey = new Date(now.getTime() - 86400000).toISOString().split("T")[0];
-      const timeStr = d.toLocaleTimeString("ar-EG", { hour: "2-digit", minute: "2-digit" });
-      if (dateKey === todayKey) return `آخر ظهور اليوم ${timeStr}`;
-      if (dateKey === yKey) return `آخر ظهور أمس ${timeStr}`;
-      const dateStr = d.toLocaleDateString("ar-EG", { day: "numeric", month: "long" });
-      return `آخر ظهور ${dateStr} ${timeStr}`;
-    } catch (_) {
-      return "";
-    }
-  }
-
-  async function refreshActivePresence(forceFetch = false) {
-    if (!chatSubtitle) return;
-    if (!currentReceiverId) {
-      chatSubtitle.textContent = "";
-      return;
-    }
-    const uid = String(currentReceiverId);
-    const isOnline = onlineUsers.has(uid);
-    if (isOnline) {
-      chatSubtitle.textContent = "متصل الآن";
-      return;
-    }
-    const cached = lastSeenByUserId.get(uid);
-    if (cached && !forceFetch) {
-      chatSubtitle.textContent = formatLastSeen(cached) || "غير متصل";
-      return;
-    }
-    try {
-      const res = await fetch(`/api/users/${encodeURIComponent(uid)}/presence`, { credentials: "same-origin" });
-      const data = await res.json().catch(() => ({}));
-      if (res.ok && data?.ok) {
-        if (data.last_seen) lastSeenByUserId.set(uid, data.last_seen);
-        if (data.online) {
-          chatSubtitle.textContent = "متصل الآن";
-        } else {
-          chatSubtitle.textContent = formatLastSeen(data.last_seen) || "غير متصل";
-        }
-        return;
-      }
-    } catch (_) {}
-    chatSubtitle.textContent = "غير متصل";
   }
 
   function formatLastSeen(iso) {

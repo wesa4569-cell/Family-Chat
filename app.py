@@ -56,8 +56,37 @@ app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1)
 # this makes Flask aware of the original scheme/host (needed for secure cookies, redirects, etc.).
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 
-# Security: use env var in production
-app.secret_key = os.environ.get("SECRET_KEY") or "dev-secret-key-change-in-production"
+def _load_or_create_persistent_secret_key() -> str:
+    """Return a stable SECRET_KEY.
+
+    - Prefer SECRET_KEY from environment (recommended for production).
+    - Otherwise, generate a strong key once and persist it under instance/secret_key.txt
+      so Flask sessions remain valid across restarts.
+    """
+    env_key = os.environ.get("SECRET_KEY")
+    if env_key:
+        return env_key
+
+    try:
+        os.makedirs(app.instance_path, exist_ok=True)
+        key_path = os.path.join(app.instance_path, "secret_key.txt")
+        if os.path.exists(key_path):
+            with open(key_path, "r", encoding="utf-8") as f:
+                persisted = (f.read() or "").strip()
+                if persisted:
+                    return persisted
+        import secrets
+        persisted = secrets.token_hex(32)
+        with open(key_path, "w", encoding="utf-8") as f:
+            f.write(persisted)
+        return persisted
+    except Exception:
+        # Last resort (dev only). In production, always set SECRET_KEY.
+        return "dev-secret-key-change-in-production"
+
+
+# Security: use env var in production; fallback to persisted key for stable sessions.
+app.secret_key = _load_or_create_persistent_secret_key()
 
 # In production, you should set a strong SECRET_KEY via environment variables.
 
@@ -85,12 +114,6 @@ app.config["SESSION_REFRESH_EACH_REQUEST"] = True
 # إذا تستخدم HTTPS في الإنتاج فعّلها:
 # app.config["SESSION_COOKIE_SECURE"] = True
 
-# Keep sessions across browser restarts (required for PWA/Push reliability).
-# We do **not** store passwords on the device. Instead we keep an expiring
-# signed session cookie.
-app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=int(os.environ.get("SESSION_LIFETIME_DAYS", "30")))
-app.config["SESSION_REFRESH_EACH_REQUEST"] = True
-
 db = SQLAlchemy(app)
 socketio = SocketIO(
     app,
@@ -102,21 +125,6 @@ online_users = {}
 
 CONVERSATION_PREVIEW_LIMIT = 10
 MESSAGE_PAGE_LIMIT = 50
-
-
-@app.before_request
-def _refresh_login_session_cookie():
-    """Ensure the login session persists across browser restarts.
-
-    This sets Flask's session cookie to a *permanent* cookie when a user is
-    logged-in, so the PWA will not keep asking for credentials on every open.
-    """
-    try:
-        if session.get("user_id"):
-            session.permanent = True
-    except Exception:
-        # Never block a request due to session refresh issues.
-        pass
 
 
 # ----------------- Helpers -----------------
@@ -185,7 +193,35 @@ def _serialize_message(msg, sender_name: Optional[str] = None) -> dict:
         "message_type": getattr(msg, "message_type", "text"),
         "media_url": getattr(msg, "media_url", None),
         "media_mime": getattr(msg, "media_mime", None),
+        "is_read": getattr(msg, "is_read", False),
+        "delivered_at": _utc_iso(getattr(msg, "delivered_at", None)),
+        "read_at": _utc_iso(getattr(msg, "read_at", None)),
+        "edited_at": _utc_iso(getattr(msg, "edited_at", None)),
+        "deleted_for_all": bool(getattr(msg, "deleted_for_all", False)),
+        "reply_to_id": getattr(msg, "reply_to_id", None),
+        "forwarded": bool(getattr(msg, "forwarded", False)),
     }
+
+    # Best-effort: include reply snippet to render quote in UI
+    try:
+        rtid = getattr(msg, "reply_to_id", None)
+        if rtid:
+            is_group = getattr(msg, "group_id", None) is not None
+            if is_group:
+                rm = db.session.get(GroupMessage, int(rtid))
+            else:
+                rm = db.session.get(Message, int(rtid))
+            if rm and not bool(getattr(rm, "deleted_for_all", False)):
+                rsender = getattr(rm, "sender", None) or db.session.get(User, getattr(rm, "sender_id", None))
+                payload["reply_to"] = {
+                    "id": int(rm.id),
+                    "sender_name": (rsender.name if rsender else ""),
+                    "content": (getattr(rm, "content", "") or "")[:400],
+                }
+    except Exception:
+        pass
+
+    return payload
 
 
 def _emit_direct_message(msg):
@@ -349,6 +385,126 @@ class PushSubscription(db.Model):
     updated_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None), onupdate=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
 
     __table_args__ = (db.UniqueConstraint('user_id', 'endpoint', name='uq_push_user_endpoint'),)
+
+
+class MessageReaction(db.Model):
+    __tablename__ = "message_reactions"
+
+    id = db.Column(db.Integer, primary_key=True)
+    message_id = db.Column(db.Integer, nullable=False, index=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False, index=True)
+    emoji = db.Column(db.String(32), nullable=False)
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None), index=True)
+
+    user = db.relationship("User", foreign_keys=[user_id])
+
+    __table_args__ = (
+        db.UniqueConstraint("message_id", "user_id", "emoji", name="uq_react_msg_user_emoji"),
+        db.Index("ix_react_msg_user", "message_id", "user_id"),
+    )
+
+
+class MessageVisibility(db.Model):
+    """Per-user soft delete (delete for me) for direct and group messages."""
+    __tablename__ = "message_visibility"
+
+    id = db.Column(db.Integer, primary_key=True)
+    message_type = db.Column(db.String(16), nullable=False, index=True)  # dm|group
+    message_id = db.Column(db.Integer, nullable=False, index=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False, index=True)
+    is_deleted_for_me = db.Column(db.Boolean, default=True, nullable=False, index=True)
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None), index=True)
+
+    __table_args__ = (
+        db.UniqueConstraint("message_type", "message_id", "user_id", name="uq_vis_type_msg_user"),
+        db.Index("ix_vis_user_type", "user_id", "message_type"),
+    )
+
+
+class ConversationSetting(db.Model):
+    __tablename__ = "conversation_settings"
+
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False, index=True)
+    conversation_type = db.Column(db.String(16), nullable=False, index=True)  # dm|group
+    conversation_id = db.Column(db.Integer, nullable=False, index=True)  # other_user_id or group_id
+    is_archived = db.Column(db.Boolean, default=False, index=True)
+    pinned_rank = db.Column(db.Integer, nullable=True, index=True)
+    muted_until = db.Column(db.DateTime, nullable=True, index=True)
+    updated_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None), onupdate=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
+
+    __table_args__ = (
+        db.UniqueConstraint("user_id", "conversation_type", "conversation_id", name="uq_conv_settings"),
+        db.Index("ix_conv_user_arch", "user_id", "is_archived"),
+    )
+
+
+
+
+def is_conversation_muted(user_id: int, conv_type: str, conv_id: int) -> bool:
+    """Return True if user has muted this conversation and mute is still active."""
+    try:
+        row = ConversationSetting.query.filter_by(
+            user_id=int(user_id),
+            conversation_type=str(conv_type),
+            conversation_id=int(conv_id),
+        ).first()
+        if row and row.muted_until:
+            return row.muted_until > datetime.utcnow()
+    except Exception:
+        return False
+    return False
+
+class StarredMessage(db.Model):
+    __tablename__ = "starred_messages"
+
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False, index=True)
+    message_type = db.Column(db.String(16), nullable=False, index=True)  # dm|group
+    message_id = db.Column(db.Integer, nullable=False, index=True)
+    starred_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None), index=True)
+
+    __table_args__ = (
+        db.UniqueConstraint("user_id", "message_type", "message_id", name="uq_star_user_type_msg"),
+        db.Index("ix_star_user", "user_id", "starred_at"),
+    )
+
+
+class GroupInviteLink(db.Model):
+    __tablename__ = "group_invite_links"
+
+    id = db.Column(db.Integer, primary_key=True)
+    group_id = db.Column(db.Integer, db.ForeignKey("groups.id"), nullable=False, index=True)
+    token = db.Column(db.String(128), nullable=False, unique=True, index=True)
+    expires_at = db.Column(db.DateTime, nullable=True, index=True)
+    max_uses = db.Column(db.Integer, nullable=True)
+    uses = db.Column(db.Integer, default=0)
+    created_by = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None), index=True)
+
+
+class GroupMessageReceipt(db.Model):
+    __tablename__ = "group_message_receipts"
+
+    id = db.Column(db.Integer, primary_key=True)
+    group_message_id = db.Column(db.Integer, db.ForeignKey("group_messages.id"), nullable=False, index=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False, index=True)
+    delivered_at = db.Column(db.DateTime, nullable=True, index=True)
+    read_at = db.Column(db.DateTime, nullable=True, index=True)
+    __table_args__ = (
+        db.UniqueConstraint("group_message_id", "user_id", name="uq_gmr_msg_user"),
+    )
+
+
+class GroupMessageMention(db.Model):
+    __tablename__ = "group_message_mentions"
+
+    id = db.Column(db.Integer, primary_key=True)
+    group_message_id = db.Column(db.Integer, db.ForeignKey("group_messages.id"), nullable=False, index=True)
+    mentioned_user_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False, index=True)
+    __table_args__ = (
+        db.UniqueConstraint("group_message_id", "mentioned_user_id", name="uq_gmm_msg_user"),
+    )
 
 
 # ----------------- Socket.IO Events -----------------
@@ -774,6 +930,100 @@ class GroupMessage(db.Model):
     )
 
 
+# ----------------- DB schema safety (no Alembic) -----------------
+def _db_is_sqlite() -> bool:
+    try:
+        return db.engine.dialect.name == "sqlite"
+    except Exception:
+        return False
+
+
+def _ensure_columns_sqlite(table: str, columns: list[tuple[str, str]]):
+    """Add missing columns to an existing SQLite table.
+
+    NOTE: SQLite supports ALTER TABLE ADD COLUMN (at the end). We keep defaults simple
+    and NULL-friendly to avoid breaking running deployments.
+    """
+    try:
+        rows = db.session.execute(db.text(f"PRAGMA table_info({table});")).fetchall()
+        existing = {r[1] for r in rows}  # name is 2nd field
+        for name, decl in columns:
+            if name in existing:
+                continue
+            db.session.execute(db.text(f"ALTER TABLE {table} ADD COLUMN {name} {decl};"))
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+
+
+def _ensure_columns_postgres(table: str, columns: list[tuple[str, str]]):
+    try:
+        for name, decl in columns:
+            db.session.execute(db.text(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {name} {decl};"))
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+
+
+_schema_checked = False
+
+@app.before_request
+def _ensure_schema_once():
+    """Ensure new columns/tables exist without requiring a migration tool."""
+    global _schema_checked
+    if _schema_checked:
+        return
+    _schema_checked = True
+
+    try:
+        db.create_all()
+    except Exception:
+        # If create_all fails (permissions etc.), we still try to continue.
+        pass
+
+    # Add columns for Message (WhatsApp-like status/reply/forward/edit/delete)
+    msg_cols = [
+        ("delivered_at", "DATETIME"),
+        ("read_at", "DATETIME"),
+        ("edited_at", "DATETIME"),
+        ("deleted_for_all", "BOOLEAN DEFAULT 0"),
+        ("reply_to_id", "INTEGER"),
+        ("forwarded", "BOOLEAN DEFAULT 0"),
+    ]
+
+    # SQLite vs Postgres declarations
+    if _db_is_sqlite():
+        _ensure_columns_sqlite("messages", msg_cols)
+        # Group members role + group message extras
+        _ensure_columns_sqlite("group_members", [("role", "TEXT DEFAULT 'member'")])
+        _ensure_columns_sqlite("group_messages", [
+            ("edited_at", "DATETIME"),
+            ("deleted_for_all", "BOOLEAN DEFAULT 0"),
+            ("reply_to_id", "INTEGER"),
+            ("message_kind", "TEXT DEFAULT 'user'"),
+            ("system_payload", "TEXT"),
+        ])
+    else:
+        pg_cols = [
+            ("delivered_at", "TIMESTAMP"),
+            ("read_at", "TIMESTAMP"),
+            ("edited_at", "TIMESTAMP"),
+            ("deleted_for_all", "BOOLEAN DEFAULT FALSE"),
+            ("reply_to_id", "INTEGER"),
+            ("forwarded", "BOOLEAN DEFAULT FALSE"),
+        ]
+        _ensure_columns_postgres("messages", pg_cols)
+        _ensure_columns_postgres("group_members", [("role", "TEXT DEFAULT 'member'")])
+        _ensure_columns_postgres("group_messages", [
+            ("edited_at", "TIMESTAMP"),
+            ("deleted_for_all", "BOOLEAN DEFAULT FALSE"),
+            ("reply_to_id", "INTEGER"),
+            ("message_kind", "TEXT DEFAULT 'user'"),
+            ("system_payload", "TEXT"),
+        ])
+
+
+
 
 @app.route("/favicon.ico")
 def favicon():
@@ -857,6 +1107,7 @@ def login():
     if request.method == "POST":
         phone = (request.form.get("phone") or "").strip()
         password = request.form.get("password") or ""
+        remember = (request.form.get("remember") or "").strip().lower() in {"1", "true", "on", "yes"}
 
         if not phone or not password:
             return render_template("login.html", error="جميع الحقول مطلوبة")
@@ -869,6 +1120,8 @@ def login():
         session["user_id"] = user.id
         session["phone_number"] = user.phone_number
         session["name"] = user.name
+        # Keep the user logged in across browser restarts (without storing password).
+        session.permanent = bool(remember)
 
         try:
             user.touch_last_seen()
@@ -2177,21 +2430,436 @@ def get_messages(other_user_id: int):
     except SQLAlchemyError:
         db.session.rollback()
 
-    return jsonify([
-        {
-            "id": m.id,
-            "sender_id": m.sender_id,
-            "receiver_id": m.receiver_id,
-            "content": m.content,
-            "timestamp_iso": (m.timestamp.replace(tzinfo=timezone.utc).isoformat().replace("+00:00","Z") if m.timestamp else None),
-            "timestamp_ms": int((m.timestamp.replace(tzinfo=timezone.utc).timestamp()) * 1000) if m.timestamp else 0,
-            "is_read": m.is_read,
-            "message_type": getattr(m, "message_type", "text"),
-            "media_url": getattr(m, "media_url", None),
-            "media_mime": getattr(m, "media_mime", None),
+    # Filter "delete for me" visibilities
+    try:
+        deleted_ids = {
+            int(r[0]) for r in db.session.query(MessageVisibility.message_id)
+            .filter_by(user_id=me, message_type="dm", is_deleted_for_me=True)
+            .all()
         }
-        for m in msgs
-    ])
+    except Exception:
+        deleted_ids = set()
+
+    out = []
+    for m in msgs:
+        if int(m.id) in deleted_ids:
+            continue
+        # If deleted for everyone, render a placeholder
+        if bool(getattr(m, "deleted_for_all", False)):
+            m = m  # keep id/timestamp
+            placeholder = _serialize_message(m)
+            placeholder["content"] = "تم حذف هذه الرسالة"
+            placeholder["message_type"] = "deleted"
+            out.append(placeholder)
+        else:
+            out.append(_serialize_message(m))
+
+    return jsonify(out)
+
+
+@app.route("/api/messages/<int:message_id>/delete_for_me", methods=["POST"])
+def api_message_delete_for_me(message_id: int):
+    if not login_required():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    me = session["user_id"]
+    msg = db.session.get(Message, message_id)
+    if not msg:
+        return jsonify({"ok": False, "error": "not_found"}), 404
+    # Only participants can delete
+    if int(msg.sender_id) != int(me) and int(msg.receiver_id) != int(me):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    try:
+        row = MessageVisibility.query.filter_by(message_type="dm", message_id=message_id, user_id=me).first()
+        if not row:
+            row = MessageVisibility(message_type="dm", message_id=message_id, user_id=me, is_deleted_for_me=True)
+            db.session.add(row)
+        else:
+            row.is_deleted_for_me = True
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+        return jsonify({"ok": False, "error": "db_error"}), 500
+    return jsonify({"ok": True})
+
+
+@app.route("/api/messages/<int:message_id>/delete_for_all", methods=["POST"])
+def api_message_delete_for_all(message_id: int):
+    if not login_required():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    me = session["user_id"]
+    msg = db.session.get(Message, message_id)
+    if not msg:
+        return jsonify({"ok": False, "error": "not_found"}), 404
+    # Only sender can delete for all
+    if int(msg.sender_id) != int(me):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    try:
+        msg.deleted_for_all = True
+        db.session.commit()
+        # Notify both sides
+        socketio.emit("message_deleted", {"type": "dm", "message_id": int(message_id), "deleted_for_all": True}, room=f"user_{msg.receiver_id}")
+        socketio.emit("message_deleted", {"type": "dm", "message_id": int(message_id), "deleted_for_all": True}, room=f"user_{msg.sender_id}")
+    except Exception:
+        db.session.rollback()
+        return jsonify({"ok": False, "error": "db_error"}), 500
+    return jsonify({"ok": True})
+
+
+def _get_or_create_conv_settings(user_id: int, conv_type: str, conv_id: int) -> ConversationSetting:
+    row = ConversationSetting.query.filter_by(user_id=user_id, conversation_type=conv_type, conversation_id=conv_id).first()
+    if not row:
+        row = ConversationSetting(user_id=user_id, conversation_type=conv_type, conversation_id=conv_id)
+        db.session.add(row)
+    return row
+
+
+@app.route("/api/conversations/<string:conv_type>/<int:conv_id>/settings", methods=["POST"])
+def api_conversation_settings(conv_type: str, conv_id: int):
+    """Set pinned/archive/mute. conv_type: dm|group"""
+    if not login_required():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    if conv_type not in {"dm", "group"}:
+        return jsonify({"ok": False, "error": "bad_type"}), 400
+    me = int(session["user_id"])
+    data = request.get_json(silent=True) or {}
+    try:
+        row = _get_or_create_conv_settings(me, conv_type, int(conv_id))
+        if "is_archived" in data:
+            row.is_archived = bool(data.get("is_archived"))
+        if "pinned_rank" in data:
+            pr = data.get("pinned_rank")
+            row.pinned_rank = int(pr) if pr is not None and str(pr).strip() != "" else None
+        if "muted_until" in data:
+            mu = data.get("muted_until")
+            if not mu:
+                row.muted_until = None
+            else:
+                # accept ISO string or seconds
+                if isinstance(mu, (int, float)):
+                    row.muted_until = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(seconds=int(mu))
+                else:
+                    try:
+                        row.muted_until = datetime.fromisoformat(str(mu).replace("Z", "+00:00")).astimezone(timezone.utc).replace(tzinfo=None)
+                    except Exception:
+                        row.muted_until = None
+        db.session.commit()
+        return jsonify({"ok": True})
+    except Exception:
+        db.session.rollback()
+        return jsonify({"ok": False, "error": "db_error"}), 500
+
+
+@app.route("/api/messages/<int:message_id>/star", methods=["POST"])
+def api_star_message(message_id: int):
+    if not login_required():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    me = int(session["user_id"])
+    msg = db.session.get(Message, message_id)
+    if not msg:
+        return jsonify({"ok": False, "error": "not_found"}), 404
+    if int(msg.sender_id) != me and int(msg.receiver_id) != me:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    data = request.get_json(silent=True) or {}
+    enable = bool(data.get("enable", True))
+    try:
+        row = StarredMessage.query.filter_by(user_id=me, message_type="dm", message_id=message_id).first()
+        if enable:
+            if not row:
+                db.session.add(StarredMessage(user_id=me, message_type="dm", message_id=message_id))
+        else:
+            if row:
+                db.session.delete(row)
+        db.session.commit()
+        return jsonify({"ok": True})
+    except Exception:
+        db.session.rollback()
+        return jsonify({"ok": False, "error": "db_error"}), 500
+
+
+@app.route("/api/starred", methods=["GET"])
+def api_get_starred():
+    """Return recent starred messages (direct messages)."""
+    if not login_required():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    me = int(session["user_id"])
+    try:
+        rows = (
+            db.session.query(StarredMessage, Message)
+            .join(Message, StarredMessage.message_id == Message.id)
+            .filter(StarredMessage.user_id == me, StarredMessage.message_type == "dm")
+            .order_by(Message.timestamp.desc(), Message.id.desc())
+            .limit(200)
+            .all()
+        )
+        out = []
+        for sm, m in rows:
+            # Compute chat name (other party)
+            other_id = int(m.receiver_id) if int(m.sender_id) == me else int(m.sender_id)
+            other = db.session.get(User, other_id)
+            out.append({
+                "message_id": int(m.id),
+                "chat_name": (other.name if other else ""),
+                "content": (m.content or ""),
+                "timestamp": _utc_iso(m.timestamp),
+            })
+        return jsonify({"ok": True, "messages": out})
+    except Exception:
+        return jsonify({"ok": False, "error": "db_error"}), 500
+
+
+
+@app.route("/api/search_messages", methods=["GET"])
+def api_search_messages():
+    if not login_required():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    me = int(session["user_id"])
+    q = (request.args.get("q") or "").strip()
+    conv_type = (request.args.get("type") or "").strip()  # dm|group
+    conv_id_raw = (request.args.get("id") or "").strip()
+    if not q or conv_type not in {"dm", "group"} or not conv_id_raw:
+        return jsonify({"ok": False, "error": "bad_request"}), 400
+    try:
+        conv_id = int(conv_id_raw)
+    except Exception:
+        return jsonify({"ok": False, "error": "bad_request"}), 400
+
+    like = f"%{q}%"
+    out = []
+    try:
+        if conv_type == "dm":
+            # Only if participant
+            other = db.session.get(User, conv_id)
+            if not other:
+                return jsonify({"ok": False, "error": "not_found"}), 404
+            rows = (
+                Message.query
+                .filter(
+                    or_(
+                        and_(Message.sender_id == me, Message.receiver_id == conv_id),
+                        and_(Message.sender_id == conv_id, Message.receiver_id == me),
+                    )
+                )
+                .filter(Message.content.ilike(like))
+                .order_by(Message.timestamp.desc(), Message.id.desc())
+                .limit(50)
+                .all()
+            )
+            for m in rows:
+                out.append({
+                    "type": "dm",
+                    "id": int(m.id),
+                    "content": (m.content or "")[:300],
+                    "timestamp": _utc_iso(m.timestamp),
+                    "sender_id": int(m.sender_id),
+                })
+        else:
+            member = GroupMember.query.filter_by(group_id=conv_id, user_id=me, status="accepted").first()
+            if not member:
+                return jsonify({"ok": False, "error": "forbidden"}), 403
+            rows = (
+                GroupMessage.query
+                .filter(GroupMessage.group_id == conv_id)
+                .filter(GroupMessage.content.ilike(like))
+                .order_by(GroupMessage.timestamp.desc(), GroupMessage.id.desc())
+                .limit(50)
+                .all()
+            )
+            for m in rows:
+                out.append({
+                    "type": "group",
+                    "id": int(m.id),
+                    "content": (m.content or "")[:300],
+                    "timestamp": _utc_iso(m.timestamp),
+                    "sender_id": int(m.sender_id),
+                })
+        return jsonify({"ok": True, "results": out})
+    except Exception:
+        return jsonify({"ok": False, "error": "db_error"}), 500
+
+
+
+@app.route("/api/messages/<int:message_id>/forward", methods=["POST"])
+def api_forward_message(message_id: int):
+    if not login_required():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    me = int(session["user_id"])
+    msg = db.session.get(Message, message_id)
+    if not msg:
+        return jsonify({"ok": False, "error": "not_found"}), 404
+    if int(msg.sender_id) != me and int(msg.receiver_id) != me:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    data = request.get_json(silent=True) or {}
+    target_type = (data.get("target_type") or "").strip()
+    target_id = data.get("target_id")
+    try:
+        target_id = int(target_id)
+    except Exception:
+        return jsonify({"ok": False, "error": "bad_request"}), 400
+    try:
+        if target_type == "dm":
+            if not db.session.get(User, target_id):
+                return jsonify({"ok": False, "error": "not_found"}), 404
+            nm = Message(sender_id=me, receiver_id=target_id, content=msg.content, message_type=msg.message_type,
+                         media_url=getattr(msg, "media_url", None), media_mime=getattr(msg, "media_mime", None),
+                         forwarded=True)
+            db.session.add(nm)
+            db.session.commit()
+            _emit_direct_message(nm)
+            return jsonify({"ok": True, "message": _serialize_message(nm)})
+        if target_type == "group":
+            member = GroupMember.query.filter_by(group_id=target_id, user_id=me, status="accepted").first()
+            if not member:
+                return jsonify({"ok": False, "error": "forbidden"}), 403
+            nm = GroupMessage(group_id=target_id, sender_id=me, content=msg.content, message_type=msg.message_type,
+                             media_url=getattr(msg, "media_url", None), media_mime=getattr(msg, "media_mime", None),
+                             message_kind="user")
+            try:
+                nm.forwarded = True  # type: ignore
+            except Exception:
+                pass
+            db.session.add(nm)
+            db.session.commit()
+            _emit_group_message(nm)
+            return jsonify({"ok": True, "message": _serialize_message(nm)})
+        return jsonify({"ok": False, "error": "bad_type"}), 400
+    except Exception:
+        db.session.rollback()
+        return jsonify({"ok": False, "error": "db_error"}), 500
+
+
+@app.route("/api/group_messages/<int:message_id>/forward", methods=["POST"])
+def api_forward_group_message(message_id: int):
+    if not login_required():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    me = int(session["user_id"])
+    msg = db.session.get(GroupMessage, message_id)
+    if not msg:
+        return jsonify({"ok": False, "error": "not_found"}), 404
+    member_src = GroupMember.query.filter_by(group_id=int(msg.group_id), user_id=me, status="accepted").first()
+    if not member_src:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    data = request.get_json(silent=True) or {}
+    target_type = (data.get("target_type") or "").strip()
+    target_id = data.get("target_id")
+    try:
+        target_id = int(target_id)
+    except Exception:
+        return jsonify({"ok": False, "error": "bad_request"}), 400
+    try:
+        if target_type == "dm":
+            if not db.session.get(User, target_id):
+                return jsonify({"ok": False, "error": "not_found"}), 404
+            nm = Message(sender_id=me, receiver_id=target_id, content=msg.content, message_type=msg.message_type,
+                         media_url=getattr(msg, "media_url", None), media_mime=getattr(msg, "media_mime", None),
+                         forwarded=True)
+            db.session.add(nm)
+            db.session.commit()
+            _emit_direct_message(nm)
+            return jsonify({"ok": True, "message": _serialize_message(nm)})
+        if target_type == "group":
+            member_dst = GroupMember.query.filter_by(group_id=target_id, user_id=me, status="accepted").first()
+            if not member_dst:
+                return jsonify({"ok": False, "error": "forbidden"}), 403
+            nm = GroupMessage(group_id=target_id, sender_id=me, content=msg.content, message_type=msg.message_type,
+                             media_url=getattr(msg, "media_url", None), media_mime=getattr(msg, "media_mime", None),
+                             message_kind="user")
+            try:
+                nm.forwarded = True  # type: ignore
+            except Exception:
+                pass
+            db.session.add(nm)
+            db.session.commit()
+            _emit_group_message(nm)
+            return jsonify({"ok": True, "message": _serialize_message(nm)})
+        return jsonify({"ok": False, "error": "bad_type"}), 400
+    except Exception:
+        db.session.rollback()
+        return jsonify({"ok": False, "error": "db_error"}), 500
+
+
+@app.route("/api/messages/<int:message_id>/edit", methods=["POST"])
+def api_edit_message(message_id: int):
+    if not login_required():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    me = int(session["user_id"])
+    msg = db.session.get(Message, message_id)
+    if not msg:
+        return jsonify({"ok": False, "error": "not_found"}), 404
+    if int(msg.sender_id) != me:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    data = request.get_json(silent=True) or {}
+    content = (data.get("content") or "").strip()
+    if not content:
+        return jsonify({"ok": False, "error": "empty"}), 400
+    if len(content) > 5000:
+        return jsonify({"ok": False, "error": "too_long"}), 400
+    try:
+        msg.content = content
+        msg.edited_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        db.session.commit()
+        # broadcast updated message
+        socketio.emit("message_edited", {"type": "dm", "message": _serialize_message(msg)}, room=f"user_{msg.sender_id}")
+        socketio.emit("message_edited", {"type": "dm", "message": _serialize_message(msg)}, room=f"user_{msg.receiver_id}")
+        return jsonify({"ok": True, "edited_at": _utc_iso(msg.edited_at)})
+    except Exception:
+        db.session.rollback()
+        return jsonify({"ok": False, "error": "db_error"}), 500
+
+
+@app.route("/api/group_messages/<int:message_id>/edit", methods=["POST"])
+def api_edit_group_message(message_id: int):
+    if not login_required():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    me = int(session["user_id"])
+    msg = db.session.get(GroupMessage, message_id)
+    if not msg:
+        return jsonify({"ok": False, "error": "not_found"}), 404
+    if int(msg.sender_id) != me:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    data = request.get_json(silent=True) or {}
+    content = (data.get("content") or "").strip()
+    if not content:
+        return jsonify({"ok": False, "error": "empty"}), 400
+    if len(content) > 5000:
+        return jsonify({"ok": False, "error": "too_long"}), 400
+    try:
+        msg.content = content
+        msg.edited_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        db.session.commit()
+        socketio.emit("message_edited", {"type": "group", "message": _serialize_message(msg)}, room=f"group_{msg.group_id}")
+        return jsonify({"ok": True, "edited_at": _utc_iso(msg.edited_at)})
+    except Exception:
+        db.session.rollback()
+        return jsonify({"ok": False, "error": "db_error"}), 500
+
+
+@app.route("/api/groups/<int:group_id>/members", methods=["GET"])
+def api_group_members(group_id: int):
+    if not login_required():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    me = int(session["user_id"])
+    m = GroupMember.query.filter_by(group_id=group_id, user_id=me, status="accepted").first()
+    if not m:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    try:
+        members = (
+            db.session.query(GroupMember, User)
+            .join(User, GroupMember.user_id == User.id)
+            .filter(GroupMember.group_id == group_id, GroupMember.status == "accepted")
+            .order_by(GroupMember.role.desc(), User.name.asc())
+            .all()
+        )
+        out = []
+        for gm, u in members:
+            out.append({
+                "user_id": int(u.id),
+                "name": u.name,
+                "phone_number": u.phone_number,
+                "role": gm.role,
+            })
+        return jsonify({"ok": True, "members": out, "my_role": m.role})
+    except Exception:
+        return jsonify({"ok": False, "error": "db_error"}), 500
 
 
 @app.route("/send_message", methods=["POST"])
