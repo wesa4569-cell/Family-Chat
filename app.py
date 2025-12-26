@@ -19,10 +19,12 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
 from sqlalchemy import or_, and_, func, case
-from sqlalchemy.orm import joinedload
+from sqlalchemy.orm import joinedload, selectinload
 from sqlalchemy.exc import SQLAlchemyError
-
+from flask_wtf.csrf import CSRFProtect
+csrf = CSRFProtect()
 # Web Push (اختياري)
+from sqlalchemy import text
 try:
     from pywebpush import webpush, WebPushException
 except Exception:  # pragma: no cover
@@ -2342,6 +2344,18 @@ def get_messages(other_user_id: int):
 
     me = session["user_id"]
 
+# تحديد عمق التاريخ المسموح
+    cutoff_date = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=90)
+    
+    base_filter = or_(
+        and_(Message.sender_id == me, Message.receiver_id == other_user_id),
+        and_(Message.sender_id == other_user_id, Message.receiver_id == me),
+    )
+    
+    query = Message.query.filter(
+        base_filter,
+        Message.timestamp >= cutoff_date  # ⭐ جديد
+    )
     # Validate other user exists
     if not db.session.get(User, other_user_id):
         return jsonify({"error": "المستخدم غير موجود"}), 404
@@ -2608,16 +2622,22 @@ def api_get_starred():
 
 
 
+from flask import request, jsonify, session
+from sqlalchemy import or_, and_
+
 @app.route("/api/search_messages", methods=["GET"])
 def api_search_messages():
     if not login_required():
         return jsonify({"ok": False, "error": "unauthorized"}), 401
+
     me = int(session["user_id"])
     q = (request.args.get("q") or "").strip()
     conv_type = (request.args.get("type") or "").strip()  # dm|group
     conv_id_raw = (request.args.get("id") or "").strip()
+
     if not q or conv_type not in {"dm", "group"} or not conv_id_raw:
         return jsonify({"ok": False, "error": "bad_request"}), 400
+
     try:
         conv_id = int(conv_id_raw)
     except Exception:
@@ -2625,12 +2645,14 @@ def api_search_messages():
 
     like = f"%{q}%"
     out = []
+
     try:
         if conv_type == "dm":
-            # Only if participant
+            # تأكد أن المستخدم الآخر موجود (اختياري لكنه جيد)
             other = db.session.get(User, conv_id)
             if not other:
                 return jsonify({"ok": False, "error": "not_found"}), 404
+
             rows = (
                 Message.query
                 .filter(
@@ -2641,37 +2663,50 @@ def api_search_messages():
                 )
                 .filter(Message.content.ilike(like))
                 .order_by(Message.timestamp.desc(), Message.id.desc())
-                .limit(50)
+                .limit(100)
                 .all()
             )
+
             for m in rows:
+                content = (m.content or "")
                 out.append({
                     "type": "dm",
                     "id": int(m.id),
-                    "content": (m.content or "")[:300],
+                    "content": content[:300],
                     "timestamp": _utc_iso(m.timestamp),
                     "sender_id": int(m.sender_id),
+                    "matched_text": highlight_match(content, q),
                 })
-        else:
-            member = GroupMember.query.filter_by(group_id=conv_id, user_id=me, status="accepted").first()
+
+        else:  # group
+            member = (
+                GroupMember.query
+                .filter_by(group_id=conv_id, user_id=me, status="accepted")
+                .first()
+            )
             if not member:
                 return jsonify({"ok": False, "error": "forbidden"}), 403
+
             rows = (
                 GroupMessage.query
                 .filter(GroupMessage.group_id == conv_id)
                 .filter(GroupMessage.content.ilike(like))
                 .order_by(GroupMessage.timestamp.desc(), GroupMessage.id.desc())
-                .limit(50)
+                .limit(100)
                 .all()
             )
+
             for m in rows:
+                content = (m.content or "")
                 out.append({
                     "type": "group",
                     "id": int(m.id),
-                    "content": (m.content or "")[:300],
+                    "content": content[:300],
                     "timestamp": _utc_iso(m.timestamp),
                     "sender_id": int(m.sender_id),
+                    "matched_text": highlight_match(content, q),
                 })
+
         return jsonify({"ok": True, "results": out})
     except Exception:
         return jsonify({"ok": False, "error": "db_error"}), 500
@@ -2842,11 +2877,16 @@ def api_group_members(group_id: int):
     if not m:
         return jsonify({"ok": False, "error": "forbidden"}), 403
     try:
+        # ⭐ استخدام selectinload لتحسين الأداء
         members = (
             db.session.query(GroupMember, User)
             .join(User, GroupMember.user_id == User.id)
+            .options(
+                selectinload(GroupMember.user),  # ⭐ جديد
+                selectinload(GroupMember.group)   # ⭐ جديد
+            )
             .filter(GroupMember.group_id == group_id, GroupMember.status == "accepted")
-            .order_by(GroupMember.role.desc(), User.name.asc())
+            .order_by(case((GroupMember.role == 'owner', 0), else_=1), User.name. asc())
             .all()
         )
         out = []
@@ -2860,7 +2900,21 @@ def api_group_members(group_id: int):
         return jsonify({"ok": True, "members": out, "my_role": m.role})
     except Exception:
         return jsonify({"ok": False, "error": "db_error"}), 500
+from flask_limiter import Limiter
+from flask_limiter. util import get_remote_address
+limiter = Limiter(
+    app=app,
+    key_func=get_remote_address,
+    default_limits=["200 per day", "50 per hour"]
+)
+from flask_limiter import Limiter
+from flask_limiter. util import get_remote_address
 
+limiter = Limiter(
+    app=app,
+    key_func=get_remote_address,
+    default_limits=["200 per day", "50 per hour"]
+)
 
 @app.route("/send_message", methods=["POST"])
 def send_message():
@@ -3729,7 +3783,33 @@ def setup_ssl():
     except Exception as e:
         print(f"❌ خطأ في إعداد SSL: {e}")
         return None
+# في app.py - أضف caching للبيانات الثابتة
+from functools import lru_cache
+import time
 
+@lru_cache(maxsize=128)
+def get_user_by_id_cached(user_id: int):
+    return db.session.get(User, user_id)
+
+# أو استخدم Redis
+# from flask_caching import Cache
+# cache = Cache(app, config={'CACHE_TYPE': 'redis'})
+# @cache.cached(timeout=300)
+# def api_users():
+#     ... 
+# نموذج جديد في app.py
+class GroupMessageReaction(db.Model):
+    __tablename__ = "group_message_reactions"
+    
+    id = db.Column(db.Integer, primary_key=True)
+    group_message_id = db.Column(db.Integer, db.ForeignKey("group_messages.id"), nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
+    emoji = db.Column(db.String(32), nullable=False)
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
+    
+    __table_args__ = (
+        db.UniqueConstraint("group_message_id", "user_id", "emoji", name="uq_gmr_msg_user_emoji"),
+    )
 if __name__ == '__main__':
     # محاولة تشغيل مع SSL
     ssl_context = setup_ssl()
@@ -3737,10 +3817,10 @@ if __name__ == '__main__':
     if ssl_context:
         print("=" * 50)
         print("🌐 الخادم يعمل مع SSL على:")
-        print(f"   https://localhost:5000")
-        print(f"   https://127.0.0.1:5000")
+        print(f"   https://localhost:5443")
+        print(f"   https://127.0.0.1:5443")
         print("\n📄 لتنزيل شهادة التطوير:")
-        print(f"   https://localhost:5000/install-certificate")
+        print(f"   https://localhost:5443/install-certificate")
         print("=" * 50)
         
     socketio.run(

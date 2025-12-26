@@ -3075,3 +3075,104 @@
   });
 
 })();
+// حفظ بيانات المستخدم بشكل آمن
+function saveUserData() {
+  const profile = {
+    id: currentUserId,
+    name: document. body.getAttribute("data-user-name"),
+    phone: document.body.getAttribute("data-user-phone"),
+    timestamp: Date.now()
+  };
+  try {
+    localStorage.setItem("chat_user_profile_v2", JSON.stringify(profile));
+  } catch (_) {}
+}
+
+document.addEventListener("DOMContentLoaded", saveUserData);
+ function initAllUI() {
+    requestNotificationPermission();
+    initNotificationSettingsUI();
+    initSocket();
+    initMessageActionsUI();
+    initHeaderModalsUI();
+    initConversationContextMenu();
+    initSearchModalUI();
+  }
+  
+  initAllUI();
+// في chat.js - أضف skeleton loader محسّن
+function showAdvancedSkeleton() {
+  const skeleton = `
+    <div class="message receiver" style="opacity: 0.6;">
+      <div style="display: flex; gap: 12px;">
+        <div style="width: 32px; height: 32px; border-radius: 50%; background:  linear-gradient(90deg, #f0f0f0 25%, #e0e0e0 50%, #f0f0f0 75%); background-size: 200% 100%; animation: loading 1.5s infinite;"></div>
+        <div style="flex: 1;">
+          <div style="height: 12px; background: linear-gradient(90deg, #f0f0f0 25%, #e0e0e0 50%, #f0f0f0 75%); border-radius: 6px; margin-bottom: 8px;"></div>
+          <div style="height: 12px; background: linear-gradient(90deg, #f0f0f0 25%, #e0e0e0 50%, #f0f0f0 75%); border-radius: 6px; width: 80%;"></div>
+        </div>
+      </div>
+    </div>`;
+  messagesDiv.insertAdjacentHTML('beforeend', skeleton);
+}
+// في chat.js - تحسين الـ touch actions
+function improveTouch() {
+  document.addEventListener('touchstart', (e) => {
+    const target = e.target. closest('.message, li. user-item, button');
+    if (target) {
+      target.style.opacity = '0.7';
+    }
+  }, { passive: true });
+  
+  document.addEventListener('touchend', (e) => {
+    const target = e.target.closest('. message, li.user-item, button');
+    if (target) {
+      target.style.opacity = '1';
+    }
+  }, { passive: true });
+}
+// في chat.js - تحسين escapeHtml
+function sanitizeHTML(text) {
+  const textarea = document.createElement('textarea');
+  textarea.textContent = text;
+  let html = textarea.innerHTML;
+  
+  // منع أي محاولة للـ script injection
+  html = html.replace(/javascript:/gi, '')
+             .replace(/on\w+\s*=/gi, '');
+  
+  return html;
+}
+
+// استخدمها بدلاً من escapeHtml: 
+// div.innerHTML = sanitizeHTML(userInput);
+// تحسين مؤشر الكتابة الحالي
+function updateTypingIndicator(senderName, isTyping) {
+  if (! isTyping) {
+    setTypingIndicator("");
+    return;
+  }
+  
+  const dots = "•••";
+  let dotCount = 1;
+  
+  const animateTyping = () => {
+    setTypingIndicator(`${senderName} ${dots.substring(0, dotCount++)}`);
+    if (dotCount > 3) dotCount = 1;
+  };
+  
+  animateTyping();
+  const interval = setInterval(animateTyping, 400);
+  setTimeout(() => clearInterval(interval), 2500);
+}
+// في chat.js - أضف polyfills
+if (!String.prototype.replaceAll) {
+  String.prototype.replaceAll = function(str, newStr) {
+    return this.split(str).join(newStr);
+  };
+}
+
+if (!Object.hasOwn) {
+  Object.hasOwn = function(obj, prop) {
+    return Object.prototype.hasOwnProperty.call(obj, prop);
+  };
+}

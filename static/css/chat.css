@@ -466,6 +466,23 @@ html, body {
 
 .overlay.show { display: block; }
 
+@media (max-width: 768px) {
+  .users-list {
+    width: 100vw ! important;
+    max-width: none;
+  }
+  
+  .chat-box {
+    /* السماح بـ slide animation أفضل */
+    transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  }
+  
+  /* تحسين أحجام الأزرار للمس */
+  button, a {
+    min-height: 44px; /* Apple guideline */
+    min-width: 44px;
+  }
+}
 /* موبايل */
 @media (max-width: 992px) {
   .users-list {
@@ -588,6 +605,28 @@ html, body {
   .skeleton-row,
   .members-loading .skeleton-line { animation: none; }
 }
+ :root {
+    --bg-primary: #0f172a;
+    --bg-secondary: #1e1b4b;
+    --text-primary: #f8fafc;
+    --border-color: rgba(255,255,255,0.1);
+  }
+  
+  body {
+    background:  var(--bg-primary);
+    color: var(--text-primary);
+  }
+  
+  .users-list {
+    background: var(--bg-secondary);
+  }
+  
+  .message.receiver {
+    background: #1e293b;
+    border-color: var(--border-color);
+    color: var(--text-primary);
+  }
+
 
 
 
