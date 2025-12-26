@@ -10,13 +10,6 @@
   <meta name="theme-color" content="#667eea">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-  <!-- أضف في head -->
-  <meta name="description" content="تطبيق محادثات عائلي آمن وسهل الاستخدام - Family Chat">
-  <meta name="keywords" content="محادثات, عائلة, اتصال, رسائل, آمن">
-  <meta property="og:title" content="محادثات عائلية">
-  <meta property="og:description" content="تواصل مع عائلتك بسهولة">
-  <meta property="og:image" content="/static/logo.svg">
-  <meta property="og: url" content="https://yourdomain.com">
   <link rel="preload" as="audio" href="{{ url_for('static', filename='sounds/notify.wav') }}">
 
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
@@ -123,15 +116,7 @@
 
     <div class="chat-box">
       <div class="chat-header">
-        <button 
-          class="menu-btn" 
-          id="openUsers"
-          aria-label="فتح قائمة المحادثات"
-          aria-expanded="false"
-          aria-controls="usersDrawer">
-          <span aria-hidden="true">☰</span>
-          <span>المحادثات</span>
-        </button>
+        <button class="menu-btn" id="openUsers" type="button" aria-controls="usersDrawer">☰ <span>المحادثات</span></button>
         <div class="chat-title-wrap">
           <img id="chat-avatar" class="chat-avatar" src="{% if active_user %}{{ url_for('static', filename='profile_pics/' ~ (active_user.profile_pic or 'default.png')) }}{% else %}{{ url_for('static', filename='profile_pics/default.png') }}{% endif %}" alt="avatar">
           <div class="chat-title-block">
