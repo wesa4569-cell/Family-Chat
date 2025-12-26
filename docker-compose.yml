@@ -1,0 +1,13 @@
+services:
+  web:
+    image: my-python-app
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      PORT: "8000"
+    volumes:
+      - .:/app
+    command: sh -c "gunicorn --reload --bind 0.0.0.0:8000 app:app"

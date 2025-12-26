@@ -1,0 +1,508 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>تسجيل الدخول - محادثات عائلية</title>
+    <link rel="icon" href="{{ url_for('static', filename='logo.svg') }}" type="image/svg+xml">
+    <link rel="manifest" href="{{ url_for('static', filename='manifest.json') }}">
+    <meta name="theme-color" content="#667eea">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Cairo:wght@400;700;900&display=swap');
+        
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Cairo', sans-serif;
+            height: 100vh;
+            overflow: hidden;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            position: relative;
+        }
+        
+        /* الخلفية المتحركة */
+        .background-layer {
+            position: fixed;
+            inset: 0;
+            width: 100%;
+            height: 100%;
+            background: radial-gradient(circle at 12% 20%, rgba(102, 126, 234, 0.25), transparent 45%),
+                        radial-gradient(circle at 88% 12%, rgba(118, 75, 162, 0.22), transparent 45%),
+                        radial-gradient(circle at 80% 85%, rgba(79, 172, 254, 0.22), transparent 45%),
+                        linear-gradient(135deg, #0f172a 0%, #1e1b4b 100%);
+            background-size: 200% 200%;
+            animation: gradientShift 24s ease infinite;
+            z-index: -2;
+        }
+        
+        .background-layer::after {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.5);
+            z-index: 1;
+        }
+        
+        @keyframes gradientShift {
+            0%, 100% { background-position: 0% 50%; }
+            50% { background-position: 100% 50%; }
+        }
+        
+        /* زر الرجوع */
+        .back-btn {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            font-size: clamp(16px, 2vw, 20px);
+            padding: 12px 30px;
+            background: rgba(255, 255, 255, 0.15);
+            backdrop-filter: blur(10px);
+            border: 2px solid rgba(255, 255, 255, 0.3);
+            border-radius: 50px;
+            color: white;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            text-decoration: none;
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            font-weight: 600;
+            z-index: 100;
+        }
+        
+        .back-btn:hover {
+            background: rgba(255, 255, 255, 0.25);
+            transform: translateX(5px);
+            border-color: rgba(255, 255, 255, 0.5);
+        }
+        
+        /* حاوية تسجيل الدخول */
+        .login-container {
+            background: rgba(255, 255, 255, 0.98);
+            padding: clamp(30px, 5vw, 50px);
+            border-radius: 25px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+            max-width: 480px;
+            width: 90%;
+            animation: fadeInUp 0.8s ease;
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+        }
+
+        @media (prefers-reduced-motion: reduce) {
+            .background-layer,
+            .login-container {
+                animation: none !important;
+            }
+        }
+        
+        @keyframes fadeInUp {
+            from {
+                opacity: 0;
+                transform: translateY(40px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+        
+        /* العنوان */
+        .login-title {
+            font-size: clamp(32px, 6vw, 48px);
+            font-weight: 900;
+            text-align: center;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            margin-bottom: 30px;
+            position: relative;
+        }
+        
+        .login-title::after {
+            content: '';
+            display: block;
+            width: 60px;
+            height: 4px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            margin: 15px auto 0;
+            border-radius: 2px;
+        }
+        
+        /* التنبيهات */
+        .alert {
+            font-size: clamp(14px, 2vw, 18px);
+            padding: 15px 20px;
+            border-radius: 15px;
+            animation: slideIn 0.5s ease;
+            margin-bottom: 20px;
+            border: none;
+            font-weight: 600;
+        }
+        
+        .alert-danger {
+            background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+            color: white;
+        }
+        
+        .alert-success {
+            background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
+            color: white;
+        }
+        
+        @keyframes slideIn {
+            from {
+                opacity: 0;
+                transform: translateX(-20px);
+            }
+            to {
+                opacity: 1;
+                transform: translateX(0);
+            }
+        }
+        
+        /* حقول النموذج */
+        .form-group {
+            margin-bottom: 25px;
+        }
+        
+        .form-label {
+            font-size: clamp(16px, 2.5vw, 20px);
+            color: #333;
+            margin-bottom: 10px;
+            font-weight: 700;
+            display: block;
+        }
+        
+        .form-control {
+            font-size: clamp(14px, 2vw, 18px);
+            padding: 15px 20px;
+            border-radius: 15px;
+            border: 2px solid #e0e0e0;
+            transition: all 0.3s ease;
+            width: 100%;
+            font-family: 'Cairo', sans-serif;
+            background: #f8f9fa;
+        }
+        
+        .form-control:focus {
+            border-color: #667eea;
+            box-shadow: 0 0 0 4px rgba(102, 126, 234, 0.1);
+            outline: none;
+            background: white;
+        }
+        
+        .form-control::placeholder {
+            color: #adb5bd;
+        }
+        
+        /* زر تسجيل الدخول */
+        .btn-login {
+            width: 100%;
+            font-size: clamp(18px, 3vw, 24px);
+            font-weight: 700;
+            padding: 15px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            border: none;
+            border-radius: 15px;
+            color: white;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            margin-top: 10px;
+            position: relative;
+            overflow: hidden;
+        }
+        
+        .btn-login::before {
+            content: '';
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            width: 0;
+            height: 0;
+            border-radius: 50%;
+            background: rgba(255, 255, 255, 0.3);
+            transform: translate(-50%, -50%);
+            transition: width 0.6s, height 0.6s;
+        }
+        
+        .btn-login:hover::before {
+            width: 400px;
+            height: 400px;
+        }
+        
+        .btn-login:hover {
+            transform: translateY(-3px);
+            box-shadow: 0 10px 30px rgba(102, 126, 234, 0.4);
+        }
+        
+        .btn-login:active {
+            transform: translateY(-1px);
+        }
+        
+        .btn-login span {
+            position: relative;
+            z-index: 1;
+        }
+        
+        /* رابط التسجيل */
+        .register-link {
+            text-align: center;
+            margin-top: 25px;
+            font-size: clamp(14px, 2vw, 18px);
+            color: #666;
+        }
+        
+        .register-link a {
+            color: #667eea;
+            text-decoration: none;
+            font-weight: 700;
+            transition: all 0.3s ease;
+            position: relative;
+        }
+        
+        .register-link a::after {
+            content: '';
+            position: absolute;
+            bottom: -2px;
+            left: 0;
+            width: 0;
+            height: 2px;
+            background: #667eea;
+            transition: width 0.3s ease;
+        }
+        
+        .register-link a:hover::after {
+            width: 100%;
+        }
+        
+        .register-link a:hover {
+            color: #764ba2;
+        }
+        
+        /* تأثير التحميل */
+        .btn-login.loading {
+            pointer-events: none;
+            opacity: 0.7;
+        }
+        
+        .btn-login.loading::after {
+            content: '';
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            width: 20px;
+            height: 20px;
+            margin: -10px 0 0 -10px;
+            border: 3px solid rgba(255, 255, 255, 0.3);
+            border-top-color: white;
+            border-radius: 50%;
+            animation: spin 0.6s linear infinite;
+        }
+        
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+        
+        /* استجابة للشاشات الصغيرة */
+        @media (max-width: 576px) {
+            .login-container {
+                padding: 30px 20px;
+            }
+            
+            .back-btn {
+                top: 10px;
+                right: 10px;
+                padding: 10px 20px;
+            }
+        }
+    
+        /* رابط نسيت كلمة المرور */
+        .forgot-link {
+            margin-top: -10px;
+            margin-bottom: 10px;
+            font-size: clamp(13px, 2vw, 16px);
+            text-align: start;
+        }
+
+        .forgot-link a {
+            color: #667eea;
+            text-decoration: none;
+            font-weight: 800;
+            transition: all 0.3s ease;
+            position: relative;
+        }
+
+        .forgot-link a::after {
+            content: '';
+            position: absolute;
+            bottom: -2px;
+            left: 0;
+            width: 0;
+            height: 2px;
+            background: #667eea;
+            transition: width 0.3s ease;
+        }
+
+        .forgot-link a:hover::after {
+            width: 100%;
+        }
+
+        .forgot-link a:hover {
+            color: #764ba2;
+        }
+        .forgot-link-below{
+            margin-top: 6px;
+            text-align: center;
+        }
+
+        .forgot-link-below a{
+            font-size: clamp(13px, 2vw, 15px);
+            font-weight: 700;
+            color: #667eea;
+            text-decoration: none;
+            transition: color 0.3s ease;
+        }
+
+        .forgot-link-below a:hover{
+            color: #764ba2;
+            text-decoration: underline;
+        }
+
+    </style>
+</head>
+<body>
+    <!-- الخلفية المتحركة -->
+    <div class="background-layer"></div>
+    
+    <!-- زر الرجوع -->
+    <a href="{{ url_for('home') }}" class="back-btn">
+        <span>←</span>
+        <span>رجوع</span>
+    </a>
+    
+    <!-- حاوية تسجيل الدخول -->
+    <div class="login-container">
+        <h2 class="login-title">تسجيل الدخول</h2>
+        
+        <!-- رسائل الأخطاء والنجاح -->
+        {% if error %}
+        <div class="alert alert-danger" role="alert">
+            <strong>⚠️</strong> {{ error }}
+        </div>
+        {% endif %}
+        
+        {% if request.args.get('registered') %}
+        <div class="alert alert-success" role="alert">
+            <strong>✓</strong> تم التسجيل بنجاح! يمكنك الآن تسجيل الدخول
+        </div>
+        {% endif %}
+        {% if request.args.get('reset') %}
+        <div class="alert alert-success" role="alert">
+            <strong>✓</strong> تم تغيير كلمة المرور بنجاح! يمكنك الآن تسجيل الدخول
+        </div>
+        {% endif %}
+
+        <!-- نموذج تسجيل الدخول -->
+        <form method="POST" action="{{ url_for('login') }}" id="loginForm">
+            <div class="form-group">
+                <label class="form-label">رقم الهاتف</label>
+                <input 
+                    type="tel" 
+                    name="phone" 
+                    class="form-control" 
+                    placeholder="أدخل رقم الهاتف" 
+                    required
+                    pattern="[0-9]{10,15}"
+                    title="يرجى إدخال رقم هاتف صحيح (10-15 رقم)"
+                    autocomplete="tel">
+            </div>
+            
+            <div class="form-group">
+                <label class="form-label">كلمة المرور</label>
+                <input 
+                    type="password" 
+                    name="password" 
+                    class="form-control" 
+                    placeholder="أدخل كلمة المرور" 
+                    required
+                    minlength="8"
+                    autocomplete="current-password">
+            </div>
+
+            <div class="form-group" style="margin-top:10px;">
+                <div class="form-check">
+                    <input class="form-check-input" type="checkbox" name="remember" id="rememberMe" checked>
+                    <label class="form-check-label" for="rememberMe" style="font-weight:700;">
+                        تذكرني على هذا الجهاز
+                    </label>
+                </div>
+            </div>
+            
+            <button type="submit" class="btn-login" id="loginBtn">
+                <span>دخول</span>
+            </button>
+        </form>
+        
+        <!-- رابط التسجيل -->
+        <div class="register-link">
+    ليس لديك حساب؟
+    <a href="{{ url_for('register') }}">سجل الآن</a>
+    </div>
+
+        <div class="forgot-link-below">
+    <a href="{{ url_for('forgot_password') }}">هل نسيت كلمة المرور؟</a>
+    </div>
+
+   <script>
+(function () {
+  const form = document.getElementById('loginForm');
+  const phoneInput = document.querySelector('input[name="phone"]');
+  const rememberChk = document.getElementById('rememberMe');
+
+  const KEY_PHONE = 'chat_saved_phone';
+  const KEY_REMEMBER = 'chat_remember_me';
+
+  function safeGet(k){ try { return localStorage.getItem(k) || ''; } catch(e){ return ''; } }
+  function safeSet(k,v){ try { localStorage.setItem(k, v); } catch(e){} }
+  function safeDel(k){ try { localStorage.removeItem(k); } catch(e){} }
+
+  // Restore remember checkbox (default ON)
+  if (rememberChk) {
+    const v = safeGet(KEY_REMEMBER);
+    rememberChk.checked = (v === '' ? true : v === '1');
+  }
+
+  // Restore phone only if remember is ON
+  if (phoneInput && (!rememberChk || rememberChk.checked)) {
+    phoneInput.value = safeGet(KEY_PHONE);
+  }
+
+  // Save on submit
+  if (form) {
+    form.addEventListener('submit', function(){
+      if (rememberChk && rememberChk.checked) {
+        if (phoneInput) safeSet(KEY_PHONE, phoneInput.value || '');
+        safeSet(KEY_REMEMBER, '1');
+      } else {
+        safeDel(KEY_PHONE);
+        safeSet(KEY_REMEMBER, '0');
+      }
+    });
+  }
+})();
+</script>
+
+</body>
+</html>
