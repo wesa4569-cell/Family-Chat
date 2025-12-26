@@ -3032,12 +3032,62 @@
     initHeaderModalsUI();
     initConversationContextMenu();
     initSearchModalUI();
-    // Auto-enable Push subscription if user enabled it previously
-    if (readPushEnabled()) {
-      ensurePushSubscription().then((ok) => {
-        if (!ok) setPushEnabled(false);
-      });
-    }
+
+    // --- Push Notifications Auto-Setup (Best Effort) ---
+    // The goal is to keep background notifications reliable even if the tab/app is closed.
+    // Web Push still requires:
+    //  - a secure context (HTTPS with a trusted cert or localhost)
+    //  - user permission (prompt must happen due to a user gesture in many browsers)
+    // So we:
+    //  1) If permission is already granted, auto-subscribe immediately.
+    //  2) If permission is "default", we subscribe on the first user interaction.
+    //  3) We keep the existing settings toggle/UI intact.
+    (function autoSetupPush() {
+      try {
+        if (!("Notification" in window) || !("serviceWorker" in navigator) || !("PushManager" in window)) return;
+        if (!window.isSecureContext) return;
+
+        const syncUI = (enabled) => {
+          try {
+            const pushToggle = document.getElementById("pushEnableToggle");
+            if (pushToggle) pushToggle.checked = !!enabled;
+          } catch (_) {}
+        };
+
+        const attempt = async () => {
+          const ok = await ensurePushSubscription();
+          if (ok) {
+            setPushEnabled(true);
+            syncUI(true);
+          }
+          return ok;
+        };
+
+        // If the user already enabled it, ensure subscription (existing behavior)
+        if (readPushEnabled()) {
+          attempt().then((ok) => { if (!ok) { setPushEnabled(false); syncUI(false); } });
+          return;
+        }
+
+        // If permission already granted but user hasn't toggled it on yet, enable silently.
+        if (Notification.permission === "granted") {
+          attempt();
+          return;
+        }
+
+        // Otherwise, subscribe on first gesture to satisfy browser requirements.
+        if (Notification.permission === "default") {
+          const once = async () => {
+            try { await attempt(); } catch (_) {}
+          };
+          // capture:true so it runs even if something stops propagation
+          document.addEventListener("click", once, { once: true, capture: true });
+          document.addEventListener("touchstart", once, { once: true, capture: true });
+          document.addEventListener("keydown", once, { once: true, capture: true });
+        }
+      } catch (_) {}
+    })();
+
     registerServiceWorkerIfNeeded();
     updateGroupActionsVisibility();
 

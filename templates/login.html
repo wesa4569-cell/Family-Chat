@@ -327,6 +327,59 @@
                 padding: 10px 20px;
             }
         }
+    
+        /* رابط نسيت كلمة المرور */
+        .forgot-link {
+            margin-top: -10px;
+            margin-bottom: 10px;
+            font-size: clamp(13px, 2vw, 16px);
+            text-align: start;
+        }
+
+        .forgot-link a {
+            color: #667eea;
+            text-decoration: none;
+            font-weight: 800;
+            transition: all 0.3s ease;
+            position: relative;
+        }
+
+        .forgot-link a::after {
+            content: '';
+            position: absolute;
+            bottom: -2px;
+            left: 0;
+            width: 0;
+            height: 2px;
+            background: #667eea;
+            transition: width 0.3s ease;
+        }
+
+        .forgot-link a:hover::after {
+            width: 100%;
+        }
+
+        .forgot-link a:hover {
+            color: #764ba2;
+        }
+        .forgot-link-below{
+            margin-top: 6px;
+            text-align: center;
+        }
+
+        .forgot-link-below a{
+            font-size: clamp(13px, 2vw, 15px);
+            font-weight: 700;
+            color: #667eea;
+            text-decoration: none;
+            transition: color 0.3s ease;
+        }
+
+        .forgot-link-below a:hover{
+            color: #764ba2;
+            text-decoration: underline;
+        }
+
     </style>
 </head>
 <body>
@@ -355,7 +408,12 @@
             <strong>✓</strong> تم التسجيل بنجاح! يمكنك الآن تسجيل الدخول
         </div>
         {% endif %}
-        
+        {% if request.args.get('reset') %}
+        <div class="alert alert-success" role="alert">
+            <strong>✓</strong> تم تغيير كلمة المرور بنجاح! يمكنك الآن تسجيل الدخول
+        </div>
+        {% endif %}
+
         <!-- نموذج تسجيل الدخول -->
         <form method="POST" action="{{ url_for('login') }}" id="loginForm">
             <div class="form-group">
@@ -399,51 +457,51 @@
         
         <!-- رابط التسجيل -->
         <div class="register-link">
-            ليس لديك حساب؟ <a href="{{ url_for('register') }}">سجل الآن</a>
-        </div>
+    ليس لديك حساب؟
+    <a href="{{ url_for('register') }}">سجل الآن</a>
     </div>
 
-    <script>
-        // حفظ بيانات الدخول محلياً (حسب خيار "تذكرني") + تعبئة تلقائية + محاولة دخول تلقائية
-        (function() {
-            const form = document.getElementById('loginForm');
-            const phoneInput = document.querySelector('input[name="phone"]');
-            const passInput = document.querySelector('input[name="password"]');
-            const remember = document.getElementById('rememberMe');
-            if (!form || !phoneInput || !passInput) return;
+        <div class="forgot-link-below">
+    <a href="{{ url_for('forgot_password') }}">هل نسيت كلمة المرور؟</a>
+    </div>
 
-            function nowMs() { return Date.now ? Date.now() : (new Date().getTime()); }
-            <script>
-  (function () {
-    const form = document.querySelector('form');
-    const phoneInput = document.querySelector('input[name="phone_number"]');
-    const rememberChk = document.getElementById('rememberMe');
+   <script>
+(function () {
+  const form = document.getElementById('loginForm');
+  const phoneInput = document.querySelector('input[name="phone"]');
+  const rememberChk = document.getElementById('rememberMe');
 
-    const KEY_PHONE = 'chat_saved_phone';
-    const KEY_REMEMBER = 'chat_remember_me';
+  const KEY_PHONE = 'chat_saved_phone';
+  const KEY_REMEMBER = 'chat_remember_me';
 
-    function safeGet(k){ try { return localStorage.getItem(k) || ''; } catch(e){ return ''; } }
-    function safeSet(k,v){ try { localStorage.setItem(k, v); } catch(e){} }
+  function safeGet(k){ try { return localStorage.getItem(k) || ''; } catch(e){ return ''; } }
+  function safeSet(k,v){ try { localStorage.setItem(k, v); } catch(e){} }
+  function safeDel(k){ try { localStorage.removeItem(k); } catch(e){} }
 
-    // Restore phone + remember checkbox
-    if (phoneInput) phoneInput.value = safeGet(KEY_PHONE);
-    if (rememberChk) {
-      const v = safeGet(KEY_REMEMBER);
-      rememberChk.checked = (v === '' ? true : v === '1'); // default ON
-    }
+  // Restore remember checkbox (default ON)
+  if (rememberChk) {
+    const v = safeGet(KEY_REMEMBER);
+    rememberChk.checked = (v === '' ? true : v === '1');
+  }
 
-    // Save phone + remember preference on submit
-    if (form) {
-      form.addEventListener('submit', function(){
-        if (rememberChk && rememberChk.checked) {
-          if (phoneInput) safeSet(KEY_PHONE, phoneInput.value || '');
-          safeSet(KEY_REMEMBER, '1');
-        } else {
-          safeSet(KEY_REMEMBER, '0');
-        }
-      });
-    }
-  })();
+  // Restore phone only if remember is ON
+  if (phoneInput && (!rememberChk || rememberChk.checked)) {
+    phoneInput.value = safeGet(KEY_PHONE);
+  }
+
+  // Save on submit
+  if (form) {
+    form.addEventListener('submit', function(){
+      if (rememberChk && rememberChk.checked) {
+        if (phoneInput) safeSet(KEY_PHONE, phoneInput.value || '');
+        safeSet(KEY_REMEMBER, '1');
+      } else {
+        safeDel(KEY_PHONE);
+        safeSet(KEY_REMEMBER, '0');
+      }
+    });
+  }
+})();
 </script>
 
 </body>

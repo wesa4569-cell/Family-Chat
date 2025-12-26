@@ -1133,6 +1133,37 @@ def login():
 
     return render_template("login.html")
 
+@app.route("/forgot-password", methods=["GET", "POST"])
+def forgot_password():
+    if request.method == "POST":
+        phone = (request.form.get("phone") or "").strip()
+        new_password = request.form.get("new_password") or ""
+        confirm_password = request.form.get("confirm_password") or ""
+
+        if not phone or not new_password or not confirm_password:
+            return render_template("forgot_password.html", error="جميع الحقول مطلوبة")
+
+        user = User.query.filter_by(phone_number=phone).first()
+        if not user:
+            return render_template("forgot_password.html", error="رقم الهاتف غير موجود")
+
+        if len(new_password) < 8:
+            return render_template("forgot_password.html", error="كلمة المرور يجب ألا تقل عن 8 أحرف")
+
+        if new_password != confirm_password:
+            return render_template("forgot_password.html", error="كلمتا المرور غير متطابقتين")
+
+        try:
+            user.set_password(new_password)
+            db.session.commit()
+        except SQLAlchemyError:
+            db.session.rollback()
+            app.logger.exception("Forgot password error")
+            return render_template("forgot_password.html", error="حدث خطأ أثناء تحديث كلمة المرور")
+
+        return redirect(url_for("login", reset=1))
+
+    return render_template("forgot_password.html")
 
 @app.route("/logout", methods=["POST"])
 def logout():
