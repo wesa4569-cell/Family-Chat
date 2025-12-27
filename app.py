@@ -42,7 +42,13 @@ except Exception:  # pragma: no cover
     serialization = None
     base64 = None
 
+from fastapi import FastAPI
 
+app = FastAPI()
+
+@app.get("/")
+def greet_json():
+    return {"Hello": "World!"}
 
 # ----------------- App Factory-ish Setup -----------------
 app = Flask(__name__)
